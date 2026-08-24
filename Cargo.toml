@@ -10,7 +10,7 @@ name = "pixel-snap"
 path = "src/main.rs"
 
 [dependencies]
-gtk4 = { version = "0.9", package = "gtk4" }
+gtk4 = { version = "0.9", package = "gtk4", features = ["v4_8"] }
 gtk4-layer-shell = "0.5"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }

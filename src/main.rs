@@ -3,16 +3,19 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 
-use gtk4::cairo::{Context, Format, ImageSurface};
+use gtk4::cairo::Context;
 use gtk4::prelude::*;
 use gtk4::{
-    gdk, glib, Application, ApplicationWindow, DrawingArea, EventControllerKey,
-    EventControllerMotion, GestureClick,
+    gdk, glib, Application, ApplicationWindow, ContentFit, DrawingArea, EventControllerKey,
+    EventControllerMotion, GestureClick, Overlay, Picture,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use image::RgbaImage;
 
 const APP_ID: &str = "sh.omarchy.pixel-snap";
+const TOLERANCE_STEP: i32 = 4;
+const TOLERANCE_MAX: i32 = 128;
+const DEFAULT_TOLERANCE: u8 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Mode {
@@ -27,7 +30,6 @@ struct MonitorInfo {
 
 struct State {
     img: RgbaImage,
-    surface: ImageSurface,
     grad: Vec<f32>,
     gw: u32,
     gh: u32,
@@ -37,6 +39,7 @@ struct State {
     dragging: bool,
     start: Option<(f64, f64)>,
     snap_enabled: bool,
+    tolerance: u8,
     last_message: Option<String>,
 }
 
@@ -87,33 +90,6 @@ fn capture_monitor(name: &str) -> Option<RgbaImage> {
     let img = image::open(&tmp).ok()?.to_rgba8();
     let _ = std::fs::remove_file(&tmp);
     Some(img)
-}
-
-fn to_cairo_argb(img: &RgbaImage) -> ImageSurface {
-    let (w, h) = img.dimensions();
-    let mut surface =
-        ImageSurface::create(Format::ARgb32, w as i32, h as i32).expect("create cairo surface");
-    let stride = surface.stride() as usize;
-    {
-        let mut data = surface.data().expect("lock cairo surface data");
-        for y in 0..h {
-            let row = y as usize * stride;
-            for x in 0..w {
-                let (r, g, b, a) = rgba_at(img, x, y);
-                let (r, g, b, a) = (r as u32, g as u32, b as u32, a as u32);
-                let pr = (r * a) / 255;
-                let pg = (g * a) / 255;
-                let pb = (b * a) / 255;
-                let off = row + x as usize * 4;
-                data[off] = pb as u8;
-                data[off + 1] = pg as u8;
-                data[off + 2] = pr as u8;
-                data[off + 3] = a as u8;
-            }
-        }
-    }
-    surface.mark_dirty();
-    surface
 }
 
 fn compute_gradient(img: &RgbaImage) -> (Vec<f32>, u32, u32) {
@@ -177,6 +153,48 @@ fn snap_point(grad: &[f32], w: u32, h: u32, px: f64, py: f64, radius: i32, thres
         Some((x, y, _)) => (x as f64, y as f64),
         None => (px, py),
     }
+}
+
+/// Walks outward from (px, py) in all 4 directions while neighboring pixels
+/// stay within `tol` of the reference color at (px, py), per channel. This is
+/// the "how wide is this gap" auto-measurement: hovering over a padding
+/// between two differently-colored regions reports the padding's extent
+/// without needing to click two points.
+fn scan_extent(img: &RgbaImage, px: i64, py: i64, tol: u8) -> (i64, i64, i64, i64) {
+    let w = img.width() as i64;
+    let h = img.height() as i64;
+    if px < 0 || py < 0 || px >= w || py >= h {
+        return (px, px, py, py);
+    }
+    let (rr, rg, rb, _) = rgba_at(img, px as u32, py as u32);
+    let tol = tol as i32;
+    let close = |x: i64, y: i64| -> bool {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            return false;
+        }
+        let (r, g, b, _) = rgba_at(img, x as u32, y as u32);
+        (r as i32 - rr as i32).abs() <= tol
+            && (g as i32 - rg as i32).abs() <= tol
+            && (b as i32 - rb as i32).abs() <= tol
+    };
+
+    let mut left = px;
+    while close(left - 1, py) {
+        left -= 1;
+    }
+    let mut right = px;
+    while close(right + 1, py) {
+        right += 1;
+    }
+    let mut top = py;
+    while close(px, top - 1) {
+        top -= 1;
+    }
+    let mut bottom = py;
+    while close(px, bottom + 1) {
+        bottom += 1;
+    }
+    (left, right, top, bottom)
 }
 
 fn pixel_hex(img: &RgbaImage, x: u32, y: u32) -> Option<String> {
@@ -291,23 +309,57 @@ fn draw_loupe(cr: &Context, st: &State, cx: f64, cy: f64, w: i32, _h: i32) {
     let _ = cr.stroke();
 }
 
+/// Draws the auto-detected horizontal/vertical color-continuity extent
+/// around the cursor: two ticked bars plus px labels, like PixelSnap's
+/// live padding readout.
+fn draw_extent(cr: &Context, st: &State, cx: f64, cy: f64) {
+    let px = (cx * st.scale).round() as i64;
+    let py = (cy * st.scale).round() as i64;
+    let (l, r, t, b) = scan_extent(&st.img, px, py, st.tolerance);
+
+    let l_log = l as f64 / st.scale;
+    let r_log = r as f64 / st.scale;
+    let t_log = t as f64 / st.scale;
+    let b_log = b as f64 / st.scale;
+
+    cr.set_source_rgba(1.0, 0.85, 0.2, 0.95);
+    cr.set_line_width(1.5);
+
+    cr.move_to(l_log, cy);
+    cr.line_to(r_log, cy);
+    let _ = cr.stroke();
+    for tx in [l_log, r_log] {
+        cr.move_to(tx, cy - 5.0);
+        cr.line_to(tx, cy + 5.0);
+        let _ = cr.stroke();
+    }
+
+    cr.move_to(cx, t_log);
+    cr.line_to(cx, b_log);
+    let _ = cr.stroke();
+    for ty in [t_log, b_log] {
+        cr.move_to(cx - 5.0, ty);
+        cr.line_to(cx + 5.0, ty);
+        let _ = cr.stroke();
+    }
+
+    let hw = r_log - l_log;
+    let vh = b_log - t_log;
+    draw_label(cr, (l_log + r_log) / 2.0 - 16.0, cy - 10.0, &format!("{:.0}px", hw));
+    draw_label(cr, cx + 10.0, (t_log + b_log) / 2.0, &format!("{:.0}px", vh));
+}
+
 fn draw(cr: &Context, w: i32, h: i32, st: &State) {
-    cr.set_source_rgba(0.0, 0.0, 0.0, 1.0);
-    let _ = cr.paint();
-
-    let _ = cr.save();
-    let inv_scale = 1.0 / st.scale;
-    cr.scale(inv_scale, inv_scale);
-    let _ = cr.set_source_surface(&st.surface, 0.0, 0.0);
-    let _ = cr.paint();
-    let _ = cr.restore();
-
+    // The screenshot itself is painted by a GdkTexture-backed Picture widget
+    // underneath this transparent DrawingArea (composited by GSK, effectively
+    // free per frame) — this draw_func only ever paints thin lines and text,
+    // which is what keeps it fast enough to track the cursor without lag.
     cr.set_source_rgba(0.0, 0.0, 0.0, 0.12);
     let _ = cr.paint();
 
     let (cx, cy) = st.cursor;
     cr.set_line_width(1.0);
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.9);
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.5);
     cr.move_to(cx, 0.0);
     cr.line_to(cx, h as f64);
     let _ = cr.stroke();
@@ -337,13 +389,17 @@ fn draw(cr: &Context, w: i32, h: i32, st: &State) {
                     &format!("{:.0}px   dx {:.0}   dy {:.0}", dist, dx, dy),
                 );
             } else {
-                draw_label(
-                    cr,
-                    cx + 14.0,
-                    cy + 14.0,
-                    "drag to measure  ·  c: color mode  ·  s: toggle snap  ·  esc: quit",
-                );
+                draw_extent(cr, st, cx, cy);
             }
+            draw_label(
+                cr,
+                16.0,
+                h as f64 - 20.0,
+                &format!(
+                    "tolerance {}  ·  t/T adjust  ·  drag: manual measure  ·  r: reset  ·  c: color  ·  esc: quit",
+                    st.tolerance
+                ),
+            );
         }
         Mode::Color => {
             draw_loupe(cr, st, cx, cy, w, h);
@@ -356,7 +412,7 @@ fn draw(cr: &Context, w: i32, h: i32, st: &State) {
     }
 
     if let Some(msg) = &st.last_message {
-        draw_label(cr, 16.0, h as f64 - 20.0, msg);
+        draw_label(cr, 16.0, h as f64 - 44.0, msg);
     }
 }
 
@@ -370,7 +426,14 @@ fn build_ui(app: &Application) {
         std::process::exit(1);
     };
     let (grad, gw, gh) = compute_gradient(&img);
-    let surface = to_cairo_argb(&img);
+
+    let texture = gdk::MemoryTexture::new(
+        img.width() as i32,
+        img.height() as i32,
+        gdk::MemoryFormat::R8g8b8a8,
+        &glib::Bytes::from(img.as_raw().as_slice()),
+        img.width() as usize * 4,
+    );
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -394,7 +457,6 @@ fn build_ui(app: &Application) {
 
     let state = Rc::new(RefCell::new(State {
         img,
-        surface,
         grad,
         gw,
         gh,
@@ -404,12 +466,24 @@ fn build_ui(app: &Application) {
         dragging: false,
         start: None,
         snap_enabled: true,
+        tolerance: DEFAULT_TOLERANCE,
         last_message: None,
     }));
+
+    let picture = Picture::for_paintable(&texture);
+    picture.set_content_fit(ContentFit::Fill);
+    picture.set_can_shrink(true);
+    picture.set_can_target(false);
+    picture.set_hexpand(true);
+    picture.set_vexpand(true);
+    picture.set_halign(gtk4::Align::Fill);
+    picture.set_valign(gtk4::Align::Fill);
 
     let area = DrawingArea::new();
     area.set_hexpand(true);
     area.set_vexpand(true);
+    area.set_halign(gtk4::Align::Fill);
+    area.set_valign(gtk4::Align::Fill);
     area.set_can_focus(true);
 
     {
@@ -418,6 +492,10 @@ fn build_ui(app: &Application) {
             draw(cr, w, h, &state.borrow());
         });
     }
+
+    let overlay = Overlay::new();
+    overlay.set_child(Some(&picture));
+    overlay.add_overlay(&area);
 
     let motion = EventControllerMotion::new();
     {
@@ -492,7 +570,7 @@ fn build_ui(app: &Application) {
         let state = state.clone();
         let window = window.clone();
         let area = area.clone();
-        key.connect_key_pressed(move |_c, keyval, _keycode, _modifier| {
+        key.connect_key_pressed(move |_c, keyval, _keycode, modifier| {
             match keyval {
                 gdk::Key::Escape => {
                     window.close();
@@ -523,13 +601,23 @@ fn build_ui(app: &Application) {
                     area.queue_draw();
                     glib::Propagation::Stop
                 }
+                gdk::Key::t | gdk::Key::T => {
+                    let mut st = state.borrow_mut();
+                    let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
+                    let delta = if shift { -TOLERANCE_STEP } else { TOLERANCE_STEP };
+                    let next = (st.tolerance as i32 + delta).clamp(0, TOLERANCE_MAX);
+                    st.tolerance = next as u8;
+                    drop(st);
+                    area.queue_draw();
+                    glib::Propagation::Stop
+                }
                 _ => glib::Propagation::Proceed,
             }
         });
     }
     window.add_controller(key);
 
-    window.set_child(Some(&area));
+    window.set_child(Some(&overlay));
     window.present();
 }
 
