@@ -549,32 +549,27 @@ fn draw_label(cr: &Context, x: f64, y: f64, text: &str, theme: &Theme) {
     draw_label_box(cr, x, y, tw, th, text, theme);
 }
 
-/// The bottom hint bar. Shows the tolerance cycle as `off low med high`
-/// with the active level picked out in the theme accent color (rather than
-/// just naming the current value), so the whole range and where you are in
-/// it is visible at a glance — plus the remaining controls, kept short
-/// since Escape and window-close conventions don't need spelling out.
-fn draw_legend(cr: &Context, x: f64, y: f64, theme: &Theme, tolerance_level: usize) {
-    let pad = 6.0;
+/// A status badge pinned top-center, styled after omasnap's mode badge
+/// (`overlay-chrome.cpp::drawModeBadge`) and Hyprland's own workspace/window
+/// switcher OSDs: a small floating pill reporting current state rather than
+/// a line buried in a hint bar. Always visible in Ruler mode regardless of
+/// the `l` legend toggle, the same way a switcher HUD isn't gated behind a
+/// separate help overlay.
+fn draw_tolerance_badge(cr: &Context, theme: &Theme, screen_w: f64, tolerance_level: usize) {
     select_font(cr);
     let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
+    let prefix = "tolerance (t): ";
+    let value = TOLERANCE_LEVELS[tolerance_level].1.to_lowercase();
+    let (pw, ph) = measure_text(cr, prefix);
+    let (vw, _) = measure_text(cr, &value);
+    let pad_x = 14.0;
+    let pad_y = 8.0;
+    let box_w = pw + vw + pad_x * 2.0;
+    let box_h = ph + pad_y * 2.0;
+    let x = (screen_w - box_w) / 2.0;
+    let y = 14.0;
 
-    let mut segments: Vec<(String, bool)> = vec![("tolerance(t): ".to_string(), false)];
-    for (i, (_, name)) in TOLERANCE_LEVELS.iter().enumerate() {
-        if i > 0 {
-            segments.push(("  ".to_string(), false));
-        }
-        segments.push((name.to_lowercase(), i == tolerance_level));
-    }
-    segments.push(("   ·   drag: select & snap   ·   r: reset   ·   c: color   ·   l: hide legend".to_string(), false));
-
-    let widths: Vec<f64> = segments.iter().map(|(text, _)| measure_text(cr, text).0).collect();
-    let (_, line_h) = measure_text(cr, "Ag");
-    let total_w: f64 = widths.iter().sum();
-    let box_w = total_w + pad * 2.0;
-    let box_h = line_h + pad * 2.0;
-
-    cr.set_source_rgba(bg.0, bg.1, bg.2, 0.85);
+    cr.set_source_rgba(bg.0, bg.1, bg.2, 0.9);
     cr.rectangle(x, y, box_w, box_h);
     let _ = cr.fill();
     cr.set_source_rgba(ac.0, ac.1, ac.2, 0.5);
@@ -582,17 +577,52 @@ fn draw_legend(cr: &Context, x: f64, y: f64, theme: &Theme, tolerance_level: usi
     cr.rectangle(x, y, box_w, box_h);
     let _ = cr.stroke();
 
-    let mut run_x = x + pad;
-    let text_y = y + pad + line_h;
-    for ((text, highlighted), w) in segments.iter().zip(widths.iter()) {
-        if *highlighted {
-            cr.set_source_rgba(ac.0, ac.1, ac.2, 1.0);
-        } else {
-            cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
-        }
-        cr.move_to(run_x, text_y);
-        let _ = cr.show_text(text);
-        run_x += w;
+    let text_y = y + pad_y + ph;
+    cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
+    cr.move_to(x + pad_x, text_y);
+    let _ = cr.show_text(prefix);
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 1.0);
+    cr.move_to(x + pad_x + pw, text_y);
+    let _ = cr.show_text(&value);
+}
+
+/// The hint card, top-right — a compact key/action list rather than one
+/// long line, adapted from omasnap's `drawHotkeyLegend` (same idea: a small
+/// floating card, key column dimmer than the action it does) but pulling
+/// colors from the active Omarchy theme instead of a hardcoded palette.
+fn draw_legend(cr: &Context, theme: &Theme, screen_w: f64) {
+    const ENTRIES: [(&str, &str); 4] =
+        [("drag", "select & snap"), ("r", "reset"), ("c", "color"), ("l", "hide legend")];
+    select_font(cr);
+    let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
+    let pad = 10.0;
+    let key_gap = 14.0;
+    let (_, line_h) = measure_text(cr, "Ag");
+    let row_h = line_h + 6.0;
+
+    let key_w = ENTRIES.iter().map(|(k, _)| measure_text(cr, k).0).fold(0.0_f64, f64::max);
+    let val_w = ENTRIES.iter().map(|(_, v)| measure_text(cr, v).0).fold(0.0_f64, f64::max);
+    let card_w = pad * 2.0 + key_w + key_gap + val_w;
+    let card_h = pad * 2.0 + ENTRIES.len() as f64 * row_h;
+    let x = screen_w - card_w - 14.0;
+    let y = 14.0;
+
+    cr.set_source_rgba(bg.0, bg.1, bg.2, 0.9);
+    cr.rectangle(x, y, card_w, card_h);
+    let _ = cr.fill();
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.5);
+    cr.set_line_width(1.0);
+    cr.rectangle(x, y, card_w, card_h);
+    let _ = cr.stroke();
+
+    for (i, (key, val)) in ENTRIES.iter().enumerate() {
+        let row_y = y + pad + i as f64 * row_h + line_h;
+        cr.set_source_rgba(ac.0, ac.1, ac.2, 0.85);
+        cr.move_to(x + pad, row_y);
+        let _ = cr.show_text(key);
+        cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
+        cr.move_to(x + pad + key_w + key_gap, row_y);
+        let _ = cr.show_text(val);
     }
 }
 
@@ -768,7 +798,7 @@ fn place_size_box(cr: &Context, theme: &Theme, rect: Rect, text: &str, show_rati
     bounds
 }
 
-fn draw(cr: &Context, _w: i32, h: i32, st: &State) -> Option<Rect> {
+fn draw(cr: &Context, w: i32, h: i32, st: &State) -> Option<Rect> {
     // The screenshot itself is painted by a GdkTexture-backed Picture widget
     // underneath this transparent DrawingArea (composited by GSK, effectively
     // free per frame). This draw_func never touches the full viewport — every
@@ -823,12 +853,13 @@ fn draw(cr: &Context, _w: i32, h: i32, st: &State) -> Option<Rect> {
                 draw_label(cr, cx + 18.0, cy + 18.0, &format!("{:.0} x {:.0}", r - l, b - t), &st.theme);
             }
 
+            draw_tolerance_badge(cr, &st.theme, w as f64, st.tolerance_level);
             if st.show_legend {
-                draw_legend(cr, 16.0, h as f64 - 38.0, &st.theme, st.tolerance_level);
+                draw_legend(cr, &st.theme, w as f64);
             }
         }
         Mode::Color => {
-            draw_loupe(cr, st, cx, cy, _w, h);
+            draw_loupe(cr, st, cx, cy, w, h);
             let px = (cx * st.scale).round() as u32;
             let py = (cy * st.scale).round() as u32;
             if let Some(hex) = pixel_hex(&st.img, px, py) {
