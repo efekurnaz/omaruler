@@ -14,6 +14,7 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use image::RgbaImage;
 
 const APP_NAME: &str = "omaruler";
+const DISPLAY_NAME: &str = "Omaruler";
 const APP_ID: &str = "sh.omarchy.omaruler";
 const TOLERANCE_LEVELS: [(u8, &str); 4] = [(0, "Off"), (10, "Low"), (24, "Med"), (48, "High")];
 const DEFAULT_TOLERANCE_LEVEL: usize = 3;
@@ -151,7 +152,7 @@ fn fetch_theme() -> Theme {
 
 fn notify(headline: &str, description: &str) {
     let _ = Command::new("omarchy-notification-send")
-        .args(["--app-name", APP_NAME, "-u", "low", "-t", "1200", "-r", "48291"])
+        .args(["--app-name", DISPLAY_NAME, "-u", "low", "-t", "1200", "-r", "48291"])
         .arg(headline)
         .arg(description)
         .spawn();
@@ -925,7 +926,7 @@ fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .decorated(false)
-        .title(APP_NAME)
+        .title(DISPLAY_NAME)
         .build();
 
     window.set_cursor_from_name(Some("none"));

@@ -1,4 +1,4 @@
-# omaruler
+# Omaruler
 
 A [PixelSnap](https://getpixelsnap.com/)-style measuring ruler and color
 picker for Omarchy / Hyprland: hover to auto-measure the padding under your
