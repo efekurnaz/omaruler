@@ -158,6 +158,40 @@ fn notify(headline: &str, description: &str) {
         .spawn();
 }
 
+/// Transient status flash for the tolerance cycle, via Omarchy's own
+/// volume/brightness on-screen-display service — genuinely general-purpose
+/// (arbitrary icon/message, not hardcoded to a fixed set of OSD kinds), so
+/// this needed no changes on the Omarchy side. Matches the "window/
+/// workspace switch" feel: a brief themed flash on change, not a pinned
+/// overlay we'd have to hand-draw and keep in sync with the theme
+/// ourselves.
+fn flash_tolerance(level_name: &str) {
+    let _ = Command::new("omarchy-osd")
+        .args(["-m", &format!("Tolerance: {}", level_name), "-d", "1200"])
+        .spawn();
+}
+
+/// Shows the shortcut-hint card via Omarchy's `legend` shell service
+/// (companion to `omarchy-osd`, built alongside this feature) instead of
+/// hand-drawing it in Cairo — themed and positioned by the shell itself,
+/// so it looks Omarchy-native for free and stays in sync with the theme
+/// automatically.
+fn show_legend_card() {
+    let _ = Command::new("omarchy-legend")
+        .args([
+            "-e", "drag:select & snap",
+            "-e", "r:reset",
+            "-e", "c:color",
+            "-e", "l:hide legend",
+            "-c", "top-right",
+        ])
+        .spawn();
+}
+
+fn hide_legend_card() {
+    let _ = Command::new("omarchy-legend").arg("--hide").spawn();
+}
+
 fn compute_gradient(img: &RgbaImage) -> (Vec<f32>, u32, u32) {
     let (w, h) = img.dimensions();
     let gray: Vec<f32> = (0..h)
@@ -566,94 +600,6 @@ fn draw_label(cr: &Context, x: f64, y: f64, text: &str, theme: &Theme) {
     draw_label_box(cr, x, y, tw, th, text, theme);
 }
 
-/// A status badge pinned top-center, styled after omasnap's mode badge
-/// (`overlay-chrome.cpp::drawModeBadge`) and Hyprland's own workspace/window
-/// switcher OSDs: a small floating pill reporting current state rather than
-/// a line buried in a hint bar. Always visible in Ruler mode regardless of
-/// the `l` legend toggle, the same way a switcher HUD isn't gated behind a
-/// separate help overlay.
-fn draw_tolerance_badge(cr: &Context, theme: &Theme, screen_w: f64, tolerance_level: usize) {
-    select_font(cr);
-    let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
-    let prefix = "tolerance (t): ";
-    let value = TOLERANCE_LEVELS[tolerance_level].1.to_lowercase();
-    let (pw, ph) = measure_text(cr, prefix);
-    let (vw, _) = measure_text(cr, &value);
-    let pad_x = 14.0;
-    let pad_y = 8.0;
-    let box_w = pw + vw + pad_x * 2.0;
-    let box_h = ph + pad_y * 2.0;
-    let x = (screen_w - box_w) / 2.0;
-    let y = 14.0;
-
-    cr.set_source_rgba(bg.0, bg.1, bg.2, 0.9);
-    cr.rectangle(x, y, box_w, box_h);
-    let _ = cr.fill();
-    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.5);
-    cr.set_line_width(1.0);
-    cr.rectangle(x, y, box_w, box_h);
-    let _ = cr.stroke();
-
-    let text_y = y + pad_y + ph;
-    cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
-    cr.move_to(x + pad_x, text_y);
-    let _ = cr.show_text(prefix);
-    cr.set_source_rgba(ac.0, ac.1, ac.2, 1.0);
-    cr.move_to(x + pad_x + pw, text_y);
-    let _ = cr.show_text(&value);
-}
-
-/// The hint card, top-right — a compact key/action list rather than one
-/// long line, adapted from omasnap's `drawHotkeyLegend` (same idea: a small
-/// floating card, key column dimmer than the action it does) but pulling
-/// colors from the active Omarchy theme instead of a hardcoded palette.
-fn draw_legend(cr: &Context, theme: &Theme, screen_w: f64, cursor: (f64, f64)) {
-    const ENTRIES: [(&str, &str); 4] =
-        [("drag", "select & snap"), ("r", "reset"), ("c", "color"), ("l", "hide legend")];
-    select_font(cr);
-    let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
-    let pad = 10.0;
-    let key_gap = 14.0;
-    let (_, line_h) = measure_text(cr, "Ag");
-    let row_h = line_h + 6.0;
-
-    let key_w = ENTRIES.iter().map(|(k, _)| measure_text(cr, k).0).fold(0.0_f64, f64::max);
-    let val_w = ENTRIES.iter().map(|(_, v)| measure_text(cr, v).0).fold(0.0_f64, f64::max);
-    let card_w = pad * 2.0 + key_w + key_gap + val_w;
-    let card_h = pad * 2.0 + ENTRIES.len() as f64 * row_h;
-    let y = 14.0;
-
-    // Sits top-right by default, but hovering it (with a little slack, so it
-    // doesn't flip right at the pixel edge) snaps it to top-left instead —
-    // same idea as omasnap's card flip, just triggered by direct hover
-    // rather than predicting where a drag might go.
-    let right_x = screen_w - card_w - 14.0;
-    let margin = 24.0;
-    let over_right = cursor.0 >= right_x - margin
-        && cursor.0 <= right_x + card_w + margin
-        && cursor.1 >= y - margin
-        && cursor.1 <= y + card_h + margin;
-    let x = if over_right { 14.0 } else { right_x };
-
-    cr.set_source_rgba(bg.0, bg.1, bg.2, 0.9);
-    cr.rectangle(x, y, card_w, card_h);
-    let _ = cr.fill();
-    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.5);
-    cr.set_line_width(1.0);
-    cr.rectangle(x, y, card_w, card_h);
-    let _ = cr.stroke();
-
-    for (i, (key, val)) in ENTRIES.iter().enumerate() {
-        let row_y = y + pad + i as f64 * row_h + line_h;
-        cr.set_source_rgba(ac.0, ac.1, ac.2, 0.85);
-        cr.move_to(x + pad, row_y);
-        let _ = cr.show_text(key);
-        cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
-        cr.move_to(x + pad + key_w + key_gap, row_y);
-        let _ = cr.show_text(val);
-    }
-}
-
 /// A small hand-drawn camera glyph (no emoji font fallback needed), centered
 /// inside a fixed `(tw, th)` footprint so the box doesn't resize relative to
 /// the plain size-readout box it replaces on hover.
@@ -881,10 +827,6 @@ fn draw(cr: &Context, w: i32, h: i32, st: &State) -> Option<Rect> {
                 draw_label(cr, cx + 18.0, cy + 18.0, &format!("{:.0} x {:.0}", r - l, b - t), &st.theme);
             }
 
-            draw_tolerance_badge(cr, &st.theme, w as f64, st.tolerance_level);
-            if st.show_legend {
-                draw_legend(cr, &st.theme, w as f64, (cx, cy));
-            }
         }
         Mode::Color => {
             draw_loupe(cr, st, cx, cy, w, h);
@@ -1128,7 +1070,16 @@ fn build_ui(app: &Application) {
                     st.snapped_rect = None;
                     st.last_message = None;
                     sync_cursor_visibility(&window, &st);
+                    let now_ruler = st.mode == Mode::Ruler;
+                    let show_legend = st.show_legend;
                     drop(st);
+                    if now_ruler {
+                        if show_legend {
+                            show_legend_card();
+                        }
+                    } else {
+                        hide_legend_card();
+                    }
                     area.queue_draw();
                     glib::Propagation::Stop
                 }
@@ -1152,14 +1103,22 @@ fn build_ui(app: &Application) {
                 gdk::Key::t | gdk::Key::T => {
                     let mut st = state.borrow_mut();
                     st.tolerance_level = (st.tolerance_level + 1) % TOLERANCE_LEVELS.len();
+                    let name = TOLERANCE_LEVELS[st.tolerance_level].1;
                     drop(st);
+                    flash_tolerance(name);
                     area.queue_draw();
                     glib::Propagation::Stop
                 }
                 gdk::Key::l | gdk::Key::L => {
                     let mut st = state.borrow_mut();
                     st.show_legend = !st.show_legend;
+                    let show_legend = st.show_legend;
                     drop(st);
+                    if show_legend {
+                        show_legend_card();
+                    } else {
+                        hide_legend_card();
+                    }
                     area.queue_draw();
                     glib::Propagation::Stop
                 }
@@ -1169,8 +1128,20 @@ fn build_ui(app: &Application) {
     }
     window.add_controller(key);
 
+    // Whichever way the window closes, make sure the shell-rendered legend
+    // doesn't linger after this process is gone — omarchy-legend has no
+    // auto-hide timer (unlike omarchy-osd) since it's meant to persist
+    // alongside the calling app, so it's this app's job to clean it up.
+    window.connect_close_request(|_| {
+        hide_legend_card();
+        glib::Propagation::Proceed
+    });
+
     window.set_child(Some(&overlay));
     window.present();
+    if state.borrow().show_legend {
+        show_legend_card();
+    }
 }
 
 fn main() -> glib::ExitCode {
