@@ -177,10 +177,13 @@ fn flash_tolerance(level_name: &str) {
 /// so it looks Omarchy-native for free and stays in sync with the theme
 /// automatically.
 fn show_legend_card() {
+    // No reset/esc entry: Escape already resets an active selection (or
+    // quits when idle) the way anyone would expect, so spelling it out is
+    // redundant clutter rather than a genuine hint.
     let _ = Command::new("omarchy-legend")
         .args([
             "-e", "drag:select & snap",
-            "-e", "r:reset",
+            "-e", "t:tolerance",
             "-e", "c:color",
             "-e", "l:hide legend",
             "-c", "top-right",
