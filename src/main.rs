@@ -7,20 +7,27 @@ use gtk4::cairo::Context;
 use gtk4::prelude::*;
 use gtk4::{
     gdk, glib, Application, ApplicationWindow, ContentFit, DrawingArea, EventControllerKey,
-    EventControllerMotion, GestureClick, Overlay, Picture,
+    GestureClick, Overlay, Picture,
 };
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use image::RgbaImage;
 
 const APP_ID: &str = "sh.omarchy.pixel-snap";
-const TOLERANCE_STEP: i32 = 4;
-const TOLERANCE_MAX: i32 = 128;
-const DEFAULT_TOLERANCE: u8 = 12;
+const TOLERANCE_LEVELS: [(u8, &str); 4] = [(0, "Off"), (10, "Low"), (24, "Med"), (48, "High")];
+const DEFAULT_TOLERANCE_LEVEL: usize = 1;
+const MAX_EXTENT_SCAN: i64 = 2000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Mode {
     Ruler,
     Color,
+}
+
+#[derive(Clone, Copy)]
+struct Theme {
+    accent: (f64, f64, f64),
+    foreground: (f64, f64, f64),
+    background: (f64, f64, f64),
 }
 
 struct MonitorInfo {
@@ -34,12 +41,14 @@ struct State {
     gw: u32,
     gh: u32,
     scale: f64,
+    theme: Theme,
     cursor: (f64, f64),
     mode: Mode,
     dragging: bool,
     start: Option<(f64, f64)>,
     snap_enabled: bool,
-    tolerance: u8,
+    tolerance_level: usize,
+    show_legend: bool,
     last_message: Option<String>,
 }
 
@@ -90,6 +99,49 @@ fn capture_monitor(name: &str) -> Option<RgbaImage> {
     let img = image::open(&tmp).ok()?.to_rgba8();
     let _ = std::fs::remove_file(&tmp);
     Some(img)
+}
+
+fn parse_hex_color(s: &str) -> Option<(f64, f64, f64)> {
+    let s = s.trim().trim_start_matches('#');
+    if s.len() < 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some((r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0))
+}
+
+/// Resolves one semantic color from the active Omarchy theme via
+/// `omarchy-theme-color`, which handles the alias/fallback cascade that
+/// every other theme consumer (templates, tmux, GNOME, ...) shares — so
+/// this app follows the same palette as the rest of the desktop instead of
+/// hand-parsing colors.toml itself.
+fn theme_color_rgb(key: &str, fallback: (f64, f64, f64)) -> (f64, f64, f64) {
+    Command::new("omarchy-theme-color")
+        .arg(key)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| parse_hex_color(&s))
+        .unwrap_or(fallback)
+}
+
+fn fetch_theme() -> Theme {
+    Theme {
+        accent: theme_color_rgb("accent", (1.0, 0.85, 0.2)),
+        foreground: theme_color_rgb("foreground", (1.0, 1.0, 1.0)),
+        background: theme_color_rgb("background", (0.0, 0.0, 0.0)),
+    }
+}
+
+fn notify(headline: &str, description: &str) {
+    let _ = Command::new("omarchy-notification-send")
+        .args(["--app-name", "Pixel ruler", "-u", "low", "-t", "1200", "-r", "48291"])
+        .arg(headline)
+        .arg(description)
+        .spawn();
 }
 
 fn compute_gradient(img: &RgbaImage) -> (Vec<f32>, u32, u32) {
@@ -159,7 +211,9 @@ fn snap_point(grad: &[f32], w: u32, h: u32, px: f64, py: f64, radius: i32, thres
 /// stay within `tol` of the reference color at (px, py), per channel. This is
 /// the "how wide is this gap" auto-measurement: hovering over a padding
 /// between two differently-colored regions reports the padding's extent
-/// without needing to click two points.
+/// without needing to click two points. Each direction is capped at
+/// MAX_EXTENT_SCAN steps so a uniform-color background can't turn one
+/// motion frame into an unbounded scan.
 fn scan_extent(img: &RgbaImage, px: i64, py: i64, tol: u8) -> (i64, i64, i64, i64) {
     let w = img.width() as i64;
     let h = img.height() as i64;
@@ -179,22 +233,40 @@ fn scan_extent(img: &RgbaImage, px: i64, py: i64, tol: u8) -> (i64, i64, i64, i6
     };
 
     let mut left = px;
-    while close(left - 1, py) {
+    let mut steps = 0;
+    while steps < MAX_EXTENT_SCAN && close(left - 1, py) {
         left -= 1;
+        steps += 1;
     }
     let mut right = px;
-    while close(right + 1, py) {
+    steps = 0;
+    while steps < MAX_EXTENT_SCAN && close(right + 1, py) {
         right += 1;
+        steps += 1;
     }
     let mut top = py;
-    while close(px, top - 1) {
+    steps = 0;
+    while steps < MAX_EXTENT_SCAN && close(px, top - 1) {
         top -= 1;
+        steps += 1;
     }
     let mut bottom = py;
-    while close(px, bottom + 1) {
+    steps = 0;
+    while steps < MAX_EXTENT_SCAN && close(px, bottom + 1) {
         bottom += 1;
+        steps += 1;
     }
     (left, right, top, bottom)
+}
+
+/// Same walk as `scan_extent`, in the drawing area's logical coordinate
+/// space (physical / monitor scale), which is what CSS/devtools-style
+/// measurements should be reported in.
+fn scan_extent_logical(st: &State, cx: f64, cy: f64) -> (f64, f64, f64, f64) {
+    let px = (cx * st.scale).round() as i64;
+    let py = (cy * st.scale).round() as i64;
+    let (l, r, t, b) = scan_extent(&st.img, px, py, TOLERANCE_LEVELS[st.tolerance_level].0);
+    (l as f64 / st.scale, r as f64 / st.scale, t as f64 / st.scale, b as f64 / st.scale)
 }
 
 fn pixel_hex(img: &RgbaImage, x: u32, y: u32) -> Option<String> {
@@ -227,7 +299,11 @@ fn find_gdk_monitor(window: &ApplicationWindow, name: &str) -> Option<gdk::Monit
     None
 }
 
-fn draw_label(cr: &Context, x: f64, y: f64, text: &str) {
+/// Draws a themed label box. `x, y` is the box's top-left corner (not a
+/// text baseline), so callers can anchor it directly to a screen position
+/// — e.g. offset down-right of the cursor — without reasoning about font
+/// metrics.
+fn draw_label(cr: &Context, x: f64, y: f64, text: &str, theme: &Theme) {
     let _ = cr.select_font_face(
         "monospace",
         gtk4::cairo::FontSlant::Normal,
@@ -239,11 +315,19 @@ fn draw_label(cr: &Context, x: f64, y: f64, text: &str) {
         .map(|e| (e.width(), e.height()))
         .unwrap_or((text.len() as f64 * 8.0, 12.0));
     let pad = 6.0;
-    cr.set_source_rgba(0.0, 0.0, 0.0, 0.78);
-    cr.rectangle(x - pad, y - th - pad, tw + pad * 2.0, th + pad * 2.0);
+    let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
+
+    cr.set_source_rgba(bg.0, bg.1, bg.2, 0.85);
+    cr.rectangle(x, y, tw + pad * 2.0, th + pad * 2.0);
     let _ = cr.fill();
-    cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-    cr.move_to(x, y);
+
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.5);
+    cr.set_line_width(1.0);
+    cr.rectangle(x, y, tw + pad * 2.0, th + pad * 2.0);
+    let _ = cr.stroke();
+
+    cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
+    cr.move_to(x + pad, y + pad + th);
     let _ = cr.show_text(text);
 }
 
@@ -298,7 +382,8 @@ fn draw_loupe(cr: &Context, st: &State, cx: f64, cy: f64, w: i32, _h: i32) {
     }
     let _ = cr.restore();
 
-    cr.set_source_rgba(1.0, 0.85, 0.2, 0.9);
+    let ac = st.theme.accent;
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.9);
     cr.set_line_width(2.0);
     cr.rectangle(lx + half as f64 * zoom, ly + half as f64 * zoom, zoom, zoom);
     let _ = cr.stroke();
@@ -309,68 +394,52 @@ fn draw_loupe(cr: &Context, st: &State, cx: f64, cy: f64, w: i32, _h: i32) {
     let _ = cr.stroke();
 }
 
-/// Draws the auto-detected horizontal/vertical color-continuity extent
-/// around the cursor: two ticked bars plus px labels, like PixelSnap's
-/// live padding readout.
-fn draw_extent(cr: &Context, st: &State, cx: f64, cy: f64) {
-    let px = (cx * st.scale).round() as i64;
-    let py = (cy * st.scale).round() as i64;
-    let (l, r, t, b) = scan_extent(&st.img, px, py, st.tolerance);
-
-    let l_log = l as f64 / st.scale;
-    let r_log = r as f64 / st.scale;
-    let t_log = t as f64 / st.scale;
-    let b_log = b as f64 / st.scale;
-
-    cr.set_source_rgba(1.0, 0.85, 0.2, 0.95);
+/// Draws the local ticked bars for the auto-detected color-continuity
+/// extent (no full-screen guide lines — just the bounded measurement
+/// itself) plus a small dot marking the exact reference pixel.
+fn draw_extent_bars(cr: &Context, theme: &Theme, cx: f64, cy: f64, l: f64, r: f64, t: f64, b: f64) {
+    let ac = theme.accent;
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.95);
     cr.set_line_width(1.5);
 
-    cr.move_to(l_log, cy);
-    cr.line_to(r_log, cy);
+    cr.move_to(l, cy);
+    cr.line_to(r, cy);
     let _ = cr.stroke();
-    for tx in [l_log, r_log] {
+    for tx in [l, r] {
         cr.move_to(tx, cy - 5.0);
         cr.line_to(tx, cy + 5.0);
         let _ = cr.stroke();
     }
 
-    cr.move_to(cx, t_log);
-    cr.line_to(cx, b_log);
+    cr.move_to(cx, t);
+    cr.line_to(cx, b);
     let _ = cr.stroke();
-    for ty in [t_log, b_log] {
+    for ty in [t, b] {
         cr.move_to(cx - 5.0, ty);
         cr.line_to(cx + 5.0, ty);
         let _ = cr.stroke();
     }
 
-    let hw = r_log - l_log;
-    let vh = b_log - t_log;
-    draw_label(cr, (l_log + r_log) / 2.0 - 16.0, cy - 10.0, &format!("{:.0}px", hw));
-    draw_label(cr, cx + 10.0, (t_log + b_log) / 2.0, &format!("{:.0}px", vh));
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 1.0);
+    cr.arc(cx, cy, 2.5, 0.0, std::f64::consts::TAU);
+    let _ = cr.fill();
 }
 
-fn draw(cr: &Context, w: i32, h: i32, st: &State) {
+fn draw(cr: &Context, _w: i32, h: i32, st: &State) {
     // The screenshot itself is painted by a GdkTexture-backed Picture widget
     // underneath this transparent DrawingArea (composited by GSK, effectively
-    // free per frame) — this draw_func only ever paints thin lines and text,
-    // which is what keeps it fast enough to track the cursor without lag.
-    cr.set_source_rgba(0.0, 0.0, 0.0, 0.12);
-    let _ = cr.paint();
-
+    // free per frame). This draw_func never touches the full viewport — every
+    // shape below is sized to its local content — which is what keeps cost
+    // independent of screen resolution and the redraw fast enough to track
+    // the cursor without lag.
     let (cx, cy) = st.cursor;
-    cr.set_line_width(1.0);
-    cr.set_source_rgba(1.0, 1.0, 1.0, 0.5);
-    cr.move_to(cx, 0.0);
-    cr.line_to(cx, h as f64);
-    let _ = cr.stroke();
-    cr.move_to(0.0, cy);
-    cr.line_to(w as f64, cy);
-    let _ = cr.stroke();
 
     match st.mode {
         Mode::Ruler => {
+            let size_text;
             if let Some(start) = st.start {
-                cr.set_source_rgba(1.0, 0.85, 0.2, 0.95);
+                let ac = st.theme.accent;
+                cr.set_source_rgba(ac.0, ac.1, ac.2, 0.95);
                 cr.set_line_width(1.5);
                 cr.move_to(start.0, start.1);
                 cr.line_to(cx, cy);
@@ -382,37 +451,38 @@ fn draw(cr: &Context, w: i32, h: i32, st: &State) {
                 let dx = cx - start.0;
                 let dy = cy - start.1;
                 let dist = (dx * dx + dy * dy).sqrt();
-                draw_label(
-                    cr,
-                    cx + 14.0,
-                    cy + 14.0,
-                    &format!("{:.0}px   dx {:.0}   dy {:.0}", dist, dx, dy),
-                );
+                size_text = format!("{:.0}px  ({:.0} x {:.0})", dist, dx.abs(), dy.abs());
             } else {
-                draw_extent(cr, st, cx, cy);
+                let (l, r, t, b) = scan_extent_logical(st, cx, cy);
+                draw_extent_bars(cr, &st.theme, cx, cy, l, r, t, b);
+                size_text = format!("{:.0} x {:.0}", r - l, b - t);
             }
-            draw_label(
-                cr,
-                16.0,
-                h as f64 - 20.0,
-                &format!(
-                    "tolerance {}  ·  t/T adjust  ·  drag: manual measure  ·  r: reset  ·  c: color  ·  esc: quit",
-                    st.tolerance
-                ),
-            );
+            // Size readout in a box offset down-right of the cursor, out of
+            // the way of the measuring lines themselves.
+            draw_label(cr, cx + 18.0, cy + 18.0, &size_text, &st.theme);
+
+            if st.show_legend {
+                let (_, tol_name) = TOLERANCE_LEVELS[st.tolerance_level];
+                let legend = format!(
+                    "tolerance: {}  ·  t: cycle  ·  drag: manual measure  ·  r: reset  ·  c: color  ·  s: snap {}  ·  l: hide legend  ·  esc: quit",
+                    tol_name,
+                    if st.snap_enabled { "on" } else { "off" }
+                );
+                draw_label(cr, 16.0, h as f64 - 38.0, &legend, &st.theme);
+            }
         }
         Mode::Color => {
-            draw_loupe(cr, st, cx, cy, w, h);
+            draw_loupe(cr, st, cx, cy, _w, h);
             let px = (cx * st.scale).round() as u32;
             let py = (cy * st.scale).round() as u32;
             if let Some(hex) = pixel_hex(&st.img, px, py) {
-                draw_label(cr, cx + 14.0, cy - 60.0, &format!("{}  ·  click to copy  ·  esc: quit", hex));
+                draw_label(cr, cx + 18.0, cy + 18.0, &format!("{}  ·  click to copy  ·  esc: quit", hex), &st.theme);
             }
         }
     }
 
     if let Some(msg) = &st.last_message {
-        draw_label(cr, 16.0, h as f64 - 44.0, msg);
+        draw_label(cr, 16.0, h as f64 - 64.0, msg, &st.theme);
     }
 }
 
@@ -426,6 +496,7 @@ fn build_ui(app: &Application) {
         std::process::exit(1);
     };
     let (grad, gw, gh) = compute_gradient(&img);
+    let theme = fetch_theme();
 
     let texture = gdk::MemoryTexture::new(
         img.width() as i32,
@@ -461,12 +532,14 @@ fn build_ui(app: &Application) {
         gw,
         gh,
         scale: monitor.scale,
+        theme,
         cursor: (0.0, 0.0),
         mode: Mode::Ruler,
         dragging: false,
         start: None,
         snap_enabled: true,
-        tolerance: DEFAULT_TOLERANCE,
+        tolerance_level: DEFAULT_TOLERANCE_LEVEL,
+        show_legend: true,
         last_message: None,
     }));
 
@@ -497,26 +570,39 @@ fn build_ui(app: &Application) {
     overlay.set_child(Some(&picture));
     overlay.add_overlay(&area);
 
-    let motion = EventControllerMotion::new();
+    // Rather than reacting to Wayland motion events (which can be batched or
+    // delivered a frame late), poll the seat's live pointer position once
+    // per compositor frame via the frame clock. This decouples our redraw
+    // from event delivery entirely: every frame draws wherever the pointer
+    // truly is *right now*, which is what actually removes the perceived
+    // lag rather than just making the redraw itself cheaper.
     {
         let state = state.clone();
-        let area = area.clone();
-        motion.connect_motion(move |_c, x, y| {
-            let mut st = state.borrow_mut();
-            let cursor = if st.snap_enabled {
-                let px = x * st.scale;
-                let py = y * st.scale;
-                let (snx, sny) = snap_point(&st.grad, st.gw, st.gh, px, py, 6, 40.0);
-                (snx / st.scale, sny / st.scale)
-            } else {
-                (x, y)
-            };
-            st.cursor = cursor;
-            drop(st);
-            area.queue_draw();
+        area.add_tick_callback(move |area, _clock| {
+            if let Some(surface) = area.native().and_then(|n| n.surface()) {
+                let display = gtk4::prelude::WidgetExt::display(area);
+                if let Some(device) = display.default_seat().and_then(|s| s.pointer()) {
+                    if let Some((x, y, _mask)) = surface.device_position(&device) {
+                        let mut st = state.borrow_mut();
+                        let cursor = if st.snap_enabled {
+                            let px = x * st.scale;
+                            let py = y * st.scale;
+                            let (snx, sny) = snap_point(&st.grad, st.gw, st.gh, px, py, 6, 40.0);
+                            (snx / st.scale, sny / st.scale)
+                        } else {
+                            (x, y)
+                        };
+                        if st.cursor != cursor {
+                            st.cursor = cursor;
+                            drop(st);
+                            area.queue_draw();
+                        }
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
         });
     }
-    area.add_controller(motion);
 
     let click = GestureClick::new();
     click.set_button(1);
@@ -570,7 +656,7 @@ fn build_ui(app: &Application) {
         let state = state.clone();
         let window = window.clone();
         let area = area.clone();
-        key.connect_key_pressed(move |_c, keyval, _keycode, modifier| {
+        key.connect_key_pressed(move |_c, keyval, _keycode, _modifier| {
             match keyval {
                 gdk::Key::Escape => {
                     window.close();
@@ -603,10 +689,16 @@ fn build_ui(app: &Application) {
                 }
                 gdk::Key::t | gdk::Key::T => {
                     let mut st = state.borrow_mut();
-                    let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
-                    let delta = if shift { -TOLERANCE_STEP } else { TOLERANCE_STEP };
-                    let next = (st.tolerance as i32 + delta).clamp(0, TOLERANCE_MAX);
-                    st.tolerance = next as u8;
+                    st.tolerance_level = (st.tolerance_level + 1) % TOLERANCE_LEVELS.len();
+                    let name = TOLERANCE_LEVELS[st.tolerance_level].1;
+                    drop(st);
+                    notify("Tolerance", name);
+                    area.queue_draw();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::l | gdk::Key::L => {
+                    let mut st = state.borrow_mut();
+                    st.show_legend = !st.show_legend;
                     drop(st);
                     area.queue_draw();
                     glib::Propagation::Stop
