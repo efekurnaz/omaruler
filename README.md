@@ -24,6 +24,13 @@ save that selection as an image, or pick a color.
   the hand-drawn one will always look like it's lagging behind the real one.
 - Colors (measuring lines, labels) are pulled from the active Omarchy theme
   via `omarchy-theme-color`, so it matches whatever theme is set system-wide.
+- The tolerance toggle and the shortcut-hint card are rendered by the
+  Omarchy shell itself, not by Omaruler — `omarchy-osd` for the transient
+  tolerance flash, and `omarchy-legend` (a small shell service added
+  alongside Omaruler, since nothing like it existed) for the hint card.
+  Themed and positioned by the shell, so they stay in sync with the active
+  theme automatically instead of being hand-drawn in Cairo. See
+  `shell/plugins/legend/` and `shell/plugins/osd/` in the Omarchy repo.
 
 No continuous screen capture, no background daemon — it launches, does its
 job, and exits.
@@ -58,12 +65,12 @@ rectangle and save it to `~/Pictures/Screenshots/omaruler-<timestamp>.png`
 | Hover | Live padding/gap measurement (auto color-continuity extent) |
 | Click + drag | Draw a selection rectangle, snaps to content on release |
 | Hover snapped box | Shows a camera button — click to save that area as a PNG |
-| `t` | Cycle color tolerance: off / low / med / high (shown in the legend) |
+| `t` | Cycle color tolerance: off / low / med / high (flashed via `omarchy-osd`) |
 | `c` | Toggle color-picker mode (magnified pixel loupe) |
 | Click (color mode) | Copy the hex color under the cursor |
 | `s` | Toggle cursor edge-snapping |
 | `r` | Reset current selection |
-| `l` | Show/hide the hint legend |
+| `l` | Show/hide the hint legend (`omarchy-legend`) |
 | `Escape` | Reset an active selection, or quit if idle |
 
 ## Build
@@ -73,9 +80,11 @@ cargo build --release
 cp target/release/omaruler ~/.local/bin/
 ```
 
-Requires (all present on stock Omarchy): `gtk4` (with the GTK C library at
-4.8+), `gtk4-layer-shell`, `grim`, `wl-copy`, `hyprctl`,
-`omarchy-theme-color`, `omarchy-notification-send`.
+Requires: `gtk4` (with the GTK C library at 4.8+), `gtk4-layer-shell`,
+`grim`, `wl-copy`, `hyprctl`, `omarchy-theme-color`,
+`omarchy-notification-send` (all present on stock Omarchy), plus
+`omarchy-osd` (stock) and `omarchy-legend` (new — requires the
+`omarchy-legend-service` branch/PR until it lands upstream).
 
 ## Keybind
 
