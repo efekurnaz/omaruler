@@ -504,10 +504,16 @@ fn select_font(cr: &Context) {
     cr.set_font_size(13.0);
 }
 
+/// Returns (advance width, height) for `text` in the current font. Uses
+/// Cairo's x_advance rather than the ink-bounds `width()` — the latter
+/// only measures rendered glyph pixels, so a string that's pure spaces
+/// (e.g. the gaps between legend words) measures as ~0 wide even though it
+/// takes up real horizontal room, which was collapsing spacing and
+/// under-sizing background boxes.
 fn measure_text(cr: &Context, text: &str) -> (f64, f64) {
     select_font(cr);
     cr.text_extents(text)
-        .map(|e| (e.width(), e.height()))
+        .map(|e| (e.x_advance(), e.height()))
         .unwrap_or((text.len() as f64 * 8.0, 12.0))
 }
 
@@ -590,10 +596,9 @@ fn draw_legend(cr: &Context, x: f64, y: f64, theme: &Theme, tolerance_level: usi
     }
 }
 
-/// A small hand-drawn camera glyph (no emoji font fallback needed) plus a
-/// "click to save" hint, drawn inside a fixed `(tw, th)` footprint so it
-/// doesn't resize relative to the plain size-readout box it replaces on
-/// hover.
+/// A small hand-drawn camera glyph (no emoji font fallback needed), centered
+/// inside a fixed `(tw, th)` footprint so the box doesn't resize relative to
+/// the plain size-readout box it replaces on hover.
 fn draw_camera_box(cr: &Context, x: f64, y: f64, tw: f64, th: f64, theme: &Theme) {
     select_font(cr);
     let pad = 6.0;
@@ -611,7 +616,7 @@ fn draw_camera_box(cr: &Context, x: f64, y: f64, tw: f64, th: f64, theme: &Theme
 
     let icon_h = (box_h - 10.0).max(8.0);
     let icon_w = icon_h * 1.4;
-    let icon_x = x + pad;
+    let icon_x = x + (box_w - icon_w) / 2.0;
     let icon_cy = y + box_h / 2.0;
 
     cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
@@ -623,10 +628,6 @@ fn draw_camera_box(cr: &Context, x: f64, y: f64, tw: f64, th: f64, theme: &Theme
     cr.set_source_rgba(bg.0, bg.1, bg.2, 1.0);
     cr.arc(icon_x + icon_w / 2.0, icon_cy, icon_h * 0.28, 0.0, std::f64::consts::TAU);
     let _ = cr.fill();
-
-    cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
-    cr.move_to(icon_x + icon_w + 8.0, y + box_h - pad - 2.0);
-    let _ = cr.show_text("click to save");
 }
 
 fn draw_loupe(cr: &Context, st: &State, cx: f64, cy: f64, w: i32, _h: i32) {
