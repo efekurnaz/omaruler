@@ -505,36 +505,19 @@ fn find_gdk_monitor(window: &ApplicationWindow, name: &str) -> Option<gdk::Monit
     None
 }
 
-fn select_font(cr: &Context) {
-    let _ = cr.select_font_face(
-        "monospace",
-        gtk4::cairo::FontSlant::Normal,
-        gtk4::cairo::FontWeight::Bold,
-    );
-    cr.set_font_size(13.0);
-}
-
 /// Omarchy's own shell (shell/Commons/Style.qml) keeps UI chrome at regular
 /// weight — none of its Ui/ components set font.bold — with hierarchy
 /// carried by size and color instead, at a 12px base with named steps
-/// (bodySmall = 11px). Secondary/status text (the legend card, the
-/// tolerance badge) follows that scale rather than the bold 13px used for
-/// the primary measurement readout, which is closer to what Style.qml
-/// calls `subtitle` and reads fine bold since it's the one number you
-/// actually came here for.
-fn select_font_hint(cr: &Context) {
+/// (bodySmall = 11px). Every label this app draws (the measurement
+/// readout, the color hex, the legend, the tolerance badge) follows that:
+/// regular weight, bodySmall size, no exceptions.
+fn select_font(cr: &Context) {
     let _ = cr.select_font_face(
         "monospace",
         gtk4::cairo::FontSlant::Normal,
         gtk4::cairo::FontWeight::Normal,
     );
     cr.set_font_size(11.0);
-}
-
-fn text_extent_advance(cr: &Context, text: &str) -> (f64, f64) {
-    cr.text_extents(text)
-        .map(|e| (e.x_advance(), e.height()))
-        .unwrap_or((text.len() as f64 * 8.0, 12.0))
 }
 
 /// Returns (advance width, height) for `text` in the current font. Uses
@@ -545,12 +528,9 @@ fn text_extent_advance(cr: &Context, text: &str) -> (f64, f64) {
 /// under-sizing background boxes.
 fn measure_text(cr: &Context, text: &str) -> (f64, f64) {
     select_font(cr);
-    text_extent_advance(cr, text)
-}
-
-fn measure_hint_text(cr: &Context, text: &str) -> (f64, f64) {
-    select_font_hint(cr);
-    text_extent_advance(cr, text)
+    cr.text_extents(text)
+        .map(|e| (e.x_advance(), e.height()))
+        .unwrap_or((text.len() as f64 * 8.0, 12.0))
 }
 
 /// Draws a themed label box of exactly `(tw, th)` text size at top-left
@@ -592,12 +572,12 @@ fn draw_label(cr: &Context, x: f64, y: f64, text: &str, theme: &Theme) {
 /// the `l` legend toggle, the same way a switcher HUD isn't gated behind a
 /// separate help overlay.
 fn draw_tolerance_badge(cr: &Context, theme: &Theme, screen_w: f64, tolerance_level: usize) {
-    select_font_hint(cr);
+    select_font(cr);
     let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
     let prefix = "tolerance (t): ";
     let value = TOLERANCE_LEVELS[tolerance_level].1.to_lowercase();
-    let (pw, ph) = measure_hint_text(cr, prefix);
-    let (vw, _) = measure_hint_text(cr, &value);
+    let (pw, ph) = measure_text(cr, prefix);
+    let (vw, _) = measure_text(cr, &value);
     let pad_x = 14.0;
     let pad_y = 8.0;
     let box_w = pw + vw + pad_x * 2.0;
@@ -629,15 +609,15 @@ fn draw_tolerance_badge(cr: &Context, theme: &Theme, screen_w: f64, tolerance_le
 fn draw_legend(cr: &Context, theme: &Theme, screen_w: f64, cursor: (f64, f64)) {
     const ENTRIES: [(&str, &str); 4] =
         [("drag", "select & snap"), ("r", "reset"), ("c", "color"), ("l", "hide legend")];
-    select_font_hint(cr);
+    select_font(cr);
     let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
     let pad = 10.0;
     let key_gap = 14.0;
-    let (_, line_h) = measure_hint_text(cr, "Ag");
+    let (_, line_h) = measure_text(cr, "Ag");
     let row_h = line_h + 6.0;
 
-    let key_w = ENTRIES.iter().map(|(k, _)| measure_hint_text(cr, k).0).fold(0.0_f64, f64::max);
-    let val_w = ENTRIES.iter().map(|(_, v)| measure_hint_text(cr, v).0).fold(0.0_f64, f64::max);
+    let key_w = ENTRIES.iter().map(|(k, _)| measure_text(cr, k).0).fold(0.0_f64, f64::max);
+    let val_w = ENTRIES.iter().map(|(_, v)| measure_text(cr, v).0).fold(0.0_f64, f64::max);
     let card_w = pad * 2.0 + key_w + key_gap + val_w;
     let card_h = pad * 2.0 + ENTRIES.len() as f64 * row_h;
     let y = 14.0;
