@@ -422,9 +422,21 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
-/// Crops the captured screenshot to `rect` (logical coords) and saves it
-/// under ~/Pictures/Screenshots, matching Omarchy's own screenshot naming
-/// convention.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Crops the captured screenshot to `rect` (logical coords) to a temp file
+/// and opens it in omasnap's annotation editor (`--file`, which loads an
+/// existing image instead of capturing the screen). The crop is scratch
+/// space, not a saved screenshot: omasnap's own Save/Copy actions are what
+/// actually keep it (Save moves it into ~/Pictures/Screenshots itself and
+/// sends its own confirmation notification), so closing the editor without
+/// saving shouldn't leave a stray file behind. The temp file is removed the
+/// moment the omasnap process exits, whichever way that happens — spawned
+/// as one shell chain so cleanup runs independently of omaruler's own
+/// lifetime (you may well hit Escape and quit before you're done in
+/// omasnap).
 fn save_selection(st: &State, rect: Rect) {
     let (l, t, r, b) = rect;
     let iw = st.img.width();
@@ -438,16 +450,6 @@ fn save_selection(st: &State, rect: Rect) {
 
     let cropped = image::imageops::crop_imm(&st.img, pl, pt, w, h).to_image();
 
-    let Ok(home) = std::env::var("HOME") else {
-        notify(APP_NAME, "Could not resolve $HOME to save image");
-        return;
-    };
-    let dir = format!("{}/Pictures/Screenshots", home);
-    if std::fs::create_dir_all(&dir).is_err() {
-        notify(APP_NAME, "Failed to create Pictures/Screenshots");
-        return;
-    }
-
     let ts = Command::new("date")
         .arg("+%Y-%m-%d_%H-%M-%S")
         .output()
@@ -456,19 +458,21 @@ fn save_selection(st: &State, rect: Rect) {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "output".to_string());
 
-    let path = format!("{}/{}-{}.png", dir, APP_NAME, ts);
-    if cropped.save(&path).is_ok() {
-        copy_to_clipboard(&path);
-        notify(APP_NAME, &format!("Saved {}x{} to {}", w, h, path));
-        // omasnap (github.com/tobi/omasnap, already used elsewhere on this
-        // machine for screenshots) accepts an existing image path via
-        // `--file` and opens it straight into its annotation editor instead
-        // of capturing the screen — hand the crop off to it so it can be
-        // marked up right away.
-        let _ = Command::new("omasnap").arg("--file").arg(&path).spawn();
-    } else {
+    let path = std::env::temp_dir().join(format!("{}-{}.png", APP_NAME, ts));
+    let Some(path) = path.to_str() else {
         notify(APP_NAME, "Failed to save image");
+        return;
+    };
+    if cropped.save(path).is_err() {
+        notify(APP_NAME, "Failed to save image");
+        return;
     }
+
+    let quoted = shell_quote(path);
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!("omasnap --file {quoted}; rm -f {quoted}"))
+        .spawn();
 }
 
 fn point_in_rect(p: (f64, f64), r: Rect) -> bool {
@@ -510,6 +514,29 @@ fn select_font(cr: &Context) {
     cr.set_font_size(13.0);
 }
 
+/// Omarchy's own shell (shell/Commons/Style.qml) keeps UI chrome at regular
+/// weight — none of its Ui/ components set font.bold — with hierarchy
+/// carried by size and color instead, at a 12px base with named steps
+/// (bodySmall = 11px). Secondary/status text (the legend card, the
+/// tolerance badge) follows that scale rather than the bold 13px used for
+/// the primary measurement readout, which is closer to what Style.qml
+/// calls `subtitle` and reads fine bold since it's the one number you
+/// actually came here for.
+fn select_font_hint(cr: &Context) {
+    let _ = cr.select_font_face(
+        "monospace",
+        gtk4::cairo::FontSlant::Normal,
+        gtk4::cairo::FontWeight::Normal,
+    );
+    cr.set_font_size(11.0);
+}
+
+fn text_extent_advance(cr: &Context, text: &str) -> (f64, f64) {
+    cr.text_extents(text)
+        .map(|e| (e.x_advance(), e.height()))
+        .unwrap_or((text.len() as f64 * 8.0, 12.0))
+}
+
 /// Returns (advance width, height) for `text` in the current font. Uses
 /// Cairo's x_advance rather than the ink-bounds `width()` — the latter
 /// only measures rendered glyph pixels, so a string that's pure spaces
@@ -518,9 +545,12 @@ fn select_font(cr: &Context) {
 /// under-sizing background boxes.
 fn measure_text(cr: &Context, text: &str) -> (f64, f64) {
     select_font(cr);
-    cr.text_extents(text)
-        .map(|e| (e.x_advance(), e.height()))
-        .unwrap_or((text.len() as f64 * 8.0, 12.0))
+    text_extent_advance(cr, text)
+}
+
+fn measure_hint_text(cr: &Context, text: &str) -> (f64, f64) {
+    select_font_hint(cr);
+    text_extent_advance(cr, text)
 }
 
 /// Draws a themed label box of exactly `(tw, th)` text size at top-left
@@ -562,12 +592,12 @@ fn draw_label(cr: &Context, x: f64, y: f64, text: &str, theme: &Theme) {
 /// the `l` legend toggle, the same way a switcher HUD isn't gated behind a
 /// separate help overlay.
 fn draw_tolerance_badge(cr: &Context, theme: &Theme, screen_w: f64, tolerance_level: usize) {
-    select_font(cr);
+    select_font_hint(cr);
     let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
     let prefix = "tolerance (t): ";
     let value = TOLERANCE_LEVELS[tolerance_level].1.to_lowercase();
-    let (pw, ph) = measure_text(cr, prefix);
-    let (vw, _) = measure_text(cr, &value);
+    let (pw, ph) = measure_hint_text(cr, prefix);
+    let (vw, _) = measure_hint_text(cr, &value);
     let pad_x = 14.0;
     let pad_y = 8.0;
     let box_w = pw + vw + pad_x * 2.0;
@@ -599,15 +629,15 @@ fn draw_tolerance_badge(cr: &Context, theme: &Theme, screen_w: f64, tolerance_le
 fn draw_legend(cr: &Context, theme: &Theme, screen_w: f64, cursor: (f64, f64)) {
     const ENTRIES: [(&str, &str); 4] =
         [("drag", "select & snap"), ("r", "reset"), ("c", "color"), ("l", "hide legend")];
-    select_font(cr);
+    select_font_hint(cr);
     let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
     let pad = 10.0;
     let key_gap = 14.0;
-    let (_, line_h) = measure_text(cr, "Ag");
+    let (_, line_h) = measure_hint_text(cr, "Ag");
     let row_h = line_h + 6.0;
 
-    let key_w = ENTRIES.iter().map(|(k, _)| measure_text(cr, k).0).fold(0.0_f64, f64::max);
-    let val_w = ENTRIES.iter().map(|(_, v)| measure_text(cr, v).0).fold(0.0_f64, f64::max);
+    let key_w = ENTRIES.iter().map(|(k, _)| measure_hint_text(cr, k).0).fold(0.0_f64, f64::max);
+    let val_w = ENTRIES.iter().map(|(_, v)| measure_hint_text(cr, v).0).fold(0.0_f64, f64::max);
     let card_w = pad * 2.0 + key_w + key_gap + val_w;
     let card_h = pad * 2.0 + ENTRIES.len() as f64 * row_h;
     let y = 14.0;
