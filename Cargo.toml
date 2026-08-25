@@ -1,12 +1,12 @@
 [package]
-name = "omeasure"
+name = "omaruler"
 version = "0.1.0"
 edition = "2021"
 description = "A PixelSnap-style measuring ruler and color picker overlay for Omarchy/Hyprland"
 license = "MIT"
 
 [[bin]]
-name = "omeasure"
+name = "omaruler"
 path = "src/main.rs"
 
 [dependencies]

@@ -13,8 +13,8 @@ use gtk4::{
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use image::RgbaImage;
 
-const APP_NAME: &str = "omeasure";
-const APP_ID: &str = "sh.omarchy.omeasure";
+const APP_NAME: &str = "omaruler";
+const APP_ID: &str = "sh.omarchy.omaruler";
 const TOLERANCE_LEVELS: [(u8, &str); 4] = [(0, "Off"), (10, "Low"), (24, "Med"), (48, "High")];
 const DEFAULT_TOLERANCE_LEVEL: usize = 3;
 const MAX_EXTENT_SCAN: i64 = 2000;

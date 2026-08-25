@@ -1,4 +1,4 @@
-# omeasure
+# omaruler
 
 A [PixelSnap](https://getpixelsnap.com/)-style measuring ruler and color
 picker for Omarchy / Hyprland: hover to auto-measure the padding under your
@@ -46,7 +46,7 @@ snapped tight to the object.
 
 **Hover the snapped box**: once a rectangle has snapped, hovering its size
 readout swaps it to a camera icon — click to crop the screenshot to that
-rectangle and save it to `~/Pictures/Screenshots/omeasure-<timestamp>.png`
+rectangle and save it to `~/Pictures/Screenshots/omaruler-<timestamp>.png`
 (path copied to clipboard, confirmed by notification).
 
 **Color mode** (`c`): magnified pixel loupe with hex readout; click to copy.
@@ -70,7 +70,7 @@ rectangle and save it to `~/Pictures/Screenshots/omeasure-<timestamp>.png`
 
 ```sh
 cargo build --release
-cp target/release/omeasure ~/.local/bin/
+cp target/release/omaruler ~/.local/bin/
 ```
 
 Requires (all present on stock Omarchy): `gtk4` (with the GTK C library at
