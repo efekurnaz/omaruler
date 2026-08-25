@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::Write as _;
+use std::io::{Cursor, Write as _};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 
@@ -29,11 +29,24 @@ enum Mode {
     Color,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum UndoItem {
+    Rect,
+    GuideH,
+    GuideV,
+    MeasureH,
+    MeasureV,
+}
+
 #[derive(Clone, Copy)]
 struct Theme {
     accent: (f64, f64, f64),
     foreground: (f64, f64, f64),
     background: (f64, f64, f64),
+    /// Distinct color for pinned guides, so they read as a different kind of
+    /// thing from the accent-colored measuring lines/selections — matches
+    /// the design-tool convention (Figma/Sketch) of guides in pink/magenta.
+    guide: (f64, f64, f64),
 }
 
 struct MonitorInfo {
@@ -43,6 +56,10 @@ struct MonitorInfo {
 
 /// A logical-space rectangle as (left, top, right, bottom).
 type Rect = (f64, f64, f64, f64);
+/// A pinned horizontal measure line: (y, left, right), all logical.
+type HLine = (f64, f64, f64);
+/// A pinned vertical measure line: (x, top, bottom), all logical.
+type VLine = (f64, f64, f64);
 
 struct State {
     img: RgbaImage,
@@ -52,17 +69,31 @@ struct State {
     scale: f64,
     theme: Theme,
     cursor: (f64, f64),
+    /// Last raw (un-snapped) pointer position seen from the compositor, used
+    /// to tell real mouse motion apart from a keyboard nudge to `cursor` —
+    /// see the tick callback in `build_ui`.
+    last_raw_cursor: (f64, f64),
     mode: Mode,
     dragging: bool,
     start: Option<(f64, f64)>,
-    snapped_rect: Option<Rect>,
-    /// On-screen bounds of the size-readout box drawn for `snapped_rect`,
-    /// so a click can tell whether it landed on "save this" vs "start a new
-    /// drag". Recomputed every draw() call.
+    snapped_rects: Vec<Rect>,
+    /// On-screen bounds of the size-readout box drawn for the *last*
+    /// selection (only the most recent one is hover/click-interactive), so
+    /// a click can tell whether it landed on "open in omasnap" vs "start a
+    /// new drag". Recomputed every draw() call.
     hover_box: Option<Rect>,
     snap_enabled: bool,
     tolerance_level: usize,
     show_legend: bool,
+    shift_held: bool,
+    measure_lines_h: Vec<HLine>,
+    measure_lines_v: Vec<VLine>,
+    guides_h: Vec<f64>,
+    guides_v: Vec<f64>,
+    /// What was added most recently, across all of the above — so Ctrl+Z
+    /// can undo "the last thing", whatever kind it was, rather than only
+    /// one specific collection.
+    undo_stack: Vec<UndoItem>,
     last_message: Option<String>,
 }
 
@@ -147,28 +178,23 @@ fn fetch_theme() -> Theme {
         accent: theme_color_rgb("accent", (1.0, 0.85, 0.2)),
         foreground: theme_color_rgb("foreground", (1.0, 1.0, 1.0)),
         background: theme_color_rgb("background", (0.0, 0.0, 0.0)),
+        guide: theme_color_rgb("magenta", (1.0, 0.2, 0.6)),
     }
 }
 
-fn notify(headline: &str, description: &str) {
-    let _ = Command::new("omarchy-notification-send")
-        .args(["--app-name", DISPLAY_NAME, "-u", "low", "-t", "1200", "-r", "48291"])
-        .arg(headline)
-        .arg(description)
-        .spawn();
-}
-
-/// Transient status flash for the tolerance cycle, via Omarchy's own
-/// volume/brightness on-screen-display service — genuinely general-purpose
-/// (arbitrary icon/message, not hardcoded to a fixed set of OSD kinds), so
-/// this needed no changes on the Omarchy side. Matches the "window/
-/// workspace switch" feel: a brief themed flash on change, not a pinned
+/// Transient status flash via Omarchy's own volume/brightness on-screen-
+/// display service — genuinely general-purpose (arbitrary message, not
+/// hardcoded to a fixed set of OSD kinds), so this needed no changes on the
+/// Omarchy side beyond fixing a pre-existing icon-fallback bug. Matches the
+/// "window/workspace switch" feel: a brief themed flash, not a pinned
 /// overlay we'd have to hand-draw and keep in sync with the theme
 /// ourselves.
+fn flash_status(message: &str) {
+    let _ = Command::new("omarchy-osd").args(["-m", message, "-d", "1200"]).spawn();
+}
+
 fn flash_tolerance(level_name: &str) {
-    let _ = Command::new("omarchy-osd")
-        .args(["-m", &format!("Tolerance: {}", level_name), "-d", "1200"])
-        .spawn();
+    flash_status(&format!("Tolerance: {}", level_name));
 }
 
 /// Shows the shortcut-hint card via Omarchy's `legend` shell service
@@ -176,13 +202,13 @@ fn flash_tolerance(level_name: &str) {
 /// hand-drawing it in Cairo — themed and positioned by the shell itself,
 /// so it looks Omarchy-native for free and stays in sync with the theme
 /// automatically.
-fn show_legend_card() {
-    // No reset/esc entry: Escape already resets an active selection (or
-    // quits when idle) the way anyone would expect, so spelling it out is
-    // redundant clutter rather than a genuine hint.
+fn show_legend_idle() {
     let _ = Command::new("omarchy-legend")
         .args([
             "-e", "drag:select & snap",
+            "-e", "h/v:measure line",
+            "-e", "shift+h/v:guide",
+            "-e", "ctrl+z:undo",
             "-e", "t:tolerance",
             "-e", "c:color",
             "-e", "l:hide legend",
@@ -191,8 +217,41 @@ fn show_legend_card() {
         .spawn();
 }
 
+/// Legend shown once at least one selection is pinned — `c`/`s` mean
+/// something different there (copy/save the selection rather than
+/// toggling color mode / edge-snap), so the hint card needs to say so.
+fn show_legend_selection() {
+    let _ = Command::new("omarchy-legend")
+        .args([
+            "-e", "drag:new selection",
+            "-e", "c:copy",
+            "-e", "s:save",
+            "-e", "ctrl+z:undo",
+            "-e", "t:tolerance",
+            "-e", "l:hide legend",
+            "-c", "top-right",
+        ])
+        .spawn();
+}
+
 fn hide_legend_card() {
     let _ = Command::new("omarchy-legend").arg("--hide").spawn();
+}
+
+/// Picks the right legend variant (or hides it) for the current state.
+/// Called at every transition that could change which one applies: a
+/// selection being made or cleared, the `l` toggle, entering/leaving Color
+/// mode.
+fn refresh_legend(st: &State) {
+    if !st.show_legend || st.mode != Mode::Ruler {
+        hide_legend_card();
+        return;
+    }
+    if st.snapped_rects.is_empty() {
+        show_legend_idle();
+    } else {
+        show_legend_selection();
+    }
 }
 
 fn compute_gradient(img: &RgbaImage) -> (Vec<f32>, u32, u32) {
@@ -264,8 +323,12 @@ fn snap_point(grad: &[f32], w: u32, h: u32, px: f64, py: f64, radius: i32, thres
 /// between two differently-colored regions reports the padding's extent
 /// without needing to click two points. Each direction is capped at
 /// MAX_EXTENT_SCAN steps so a uniform-color background can't turn one
-/// motion frame into an unbounded scan.
-fn scan_extent(img: &RgbaImage, px: i64, py: i64, tol: u8) -> (i64, i64, i64, i64) {
+/// motion frame into an unbounded scan. A scan also stops the instant it
+/// would cross a pinned guide (`guides_x`/`guides_y`, physical coords),
+/// even if the color hasn't actually changed there — a guide is a
+/// deliberate boundary you placed, so it should behave like one regardless
+/// of what's actually under it.
+fn scan_extent(img: &RgbaImage, px: i64, py: i64, tol: u8, guides_x: &[i64], guides_y: &[i64]) -> (i64, i64, i64, i64) {
     let w = img.width() as i64;
     let h = img.height() as i64;
     if px < 0 || py < 0 || px >= w || py >= h {
@@ -274,27 +337,37 @@ fn scan_extent(img: &RgbaImage, px: i64, py: i64, tol: u8) -> (i64, i64, i64, i6
     let (rr, rg, rb, _) = rgba_at(img, px as u32, py as u32);
     let close = |x: i64, y: i64| color_close(img, x, y, w, h, (rr, rg, rb), tol);
 
+    let left_bound = guides_x.iter().copied().filter(|&g| g <= px).max().unwrap_or(i64::MIN / 2);
+    let right_bound = guides_x.iter().copied().filter(|&g| g >= px).min().unwrap_or(i64::MAX / 2);
+    let top_bound = guides_y.iter().copied().filter(|&g| g <= py).max().unwrap_or(i64::MIN / 2);
+    let bottom_bound = guides_y.iter().copied().filter(|&g| g >= py).min().unwrap_or(i64::MAX / 2);
+
+    // `>=`/`<=` (not `>`/`<`): a guide is a real boundary, so the scan is
+    // allowed to reach all the way to it — stopping one pixel short would
+    // mean a guide never actually blocks the color scan when the color
+    // happens not to change there, which is the entire point of placing
+    // one.
     let mut left = px;
     let mut steps = 0;
-    while steps < MAX_EXTENT_SCAN && close(left - 1, py) {
+    while steps < MAX_EXTENT_SCAN && left - 1 >= left_bound && close(left - 1, py) {
         left -= 1;
         steps += 1;
     }
     let mut right = px;
     steps = 0;
-    while steps < MAX_EXTENT_SCAN && close(right + 1, py) {
+    while steps < MAX_EXTENT_SCAN && right + 1 <= right_bound && close(right + 1, py) {
         right += 1;
         steps += 1;
     }
     let mut top = py;
     steps = 0;
-    while steps < MAX_EXTENT_SCAN && close(px, top - 1) {
+    while steps < MAX_EXTENT_SCAN && top - 1 >= top_bound && close(px, top - 1) {
         top -= 1;
         steps += 1;
     }
     let mut bottom = py;
     steps = 0;
-    while steps < MAX_EXTENT_SCAN && close(px, bottom + 1) {
+    while steps < MAX_EXTENT_SCAN && bottom + 1 <= bottom_bound && close(px, bottom + 1) {
         bottom += 1;
         steps += 1;
     }
@@ -312,13 +385,70 @@ fn color_close(img: &RgbaImage, x: i64, y: i64, w: i64, h: i64, reference: (u8, 
         && (b as i32 - reference.2 as i32).abs() <= tol
 }
 
+/// Where a horizontal guide placed at (px, py) should actually land: walk
+/// up and down from the reference color at that point until it changes in
+/// each direction, then snap to whichever of those two edges (top or
+/// bottom) is closer — not just wherever the general edge-magnet cursor
+/// snap happened to leave the pointer.
+fn nearest_edge_vertical(img: &RgbaImage, px: i64, py: i64, tol: u8) -> i64 {
+    let w = img.width() as i64;
+    let h = img.height() as i64;
+    if px < 0 || py < 0 || px >= w || py >= h {
+        return py;
+    }
+    let (rr, rg, rb, _) = rgba_at(img, px as u32, py as u32);
+    let close = |y: i64| color_close(img, px, y, w, h, (rr, rg, rb), tol);
+
+    let mut top = py;
+    let mut steps = 0;
+    while steps < MAX_EXTENT_SCAN && close(top - 1) {
+        top -= 1;
+        steps += 1;
+    }
+    let mut bottom = py;
+    steps = 0;
+    while steps < MAX_EXTENT_SCAN && close(bottom + 1) {
+        bottom += 1;
+        steps += 1;
+    }
+    if py - top <= bottom - py { top } else { bottom }
+}
+
+/// The horizontal-axis counterpart: nearest edge to the left or right,
+/// whichever is closer, for a vertical guide.
+fn nearest_edge_horizontal(img: &RgbaImage, px: i64, py: i64, tol: u8) -> i64 {
+    let w = img.width() as i64;
+    let h = img.height() as i64;
+    if px < 0 || py < 0 || px >= w || py >= h {
+        return px;
+    }
+    let (rr, rg, rb, _) = rgba_at(img, px as u32, py as u32);
+    let close = |x: i64| color_close(img, x, py, w, h, (rr, rg, rb), tol);
+
+    let mut left = px;
+    let mut steps = 0;
+    while steps < MAX_EXTENT_SCAN && close(left - 1) {
+        left -= 1;
+        steps += 1;
+    }
+    let mut right = px;
+    steps = 0;
+    while steps < MAX_EXTENT_SCAN && close(right + 1) {
+        right += 1;
+        steps += 1;
+    }
+    if px - left <= right - px { left } else { right }
+}
+
 /// Same walk as `scan_extent`, in the drawing area's logical coordinate
 /// space (physical / monitor scale), which is what CSS/devtools-style
 /// measurements should be reported in.
 fn scan_extent_logical(st: &State, cx: f64, cy: f64) -> Rect {
     let px = (cx * st.scale).round() as i64;
     let py = (cy * st.scale).round() as i64;
-    let (l, r, t, b) = scan_extent(&st.img, px, py, TOLERANCE_LEVELS[st.tolerance_level].0);
+    let gx: Vec<i64> = st.guides_v.iter().map(|&x| (x * st.scale).round() as i64).collect();
+    let gy: Vec<i64> = st.guides_h.iter().map(|&y| (y * st.scale).round() as i64).collect();
+    let (l, r, t, b) = scan_extent(&st.img, px, py, TOLERANCE_LEVELS[st.tolerance_level].0, &gx, &gy);
     (l as f64 / st.scale, t as f64 / st.scale, r as f64 / st.scale, b as f64 / st.scale)
 }
 
@@ -460,8 +590,47 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
+fn copy_image_to_clipboard(png_bytes: &[u8]) {
+    if let Ok(mut child) = Command::new("wl-copy").args(["--type", "image/png"]).stdin(Stdio::piped()).spawn() {
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(png_bytes);
+        }
+        let _ = child.wait();
+    }
+}
+
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn crop_rect(st: &State, rect: Rect) -> RgbaImage {
+    let (l, t, r, b) = rect;
+    let iw = st.img.width();
+    let ih = st.img.height();
+    let pl = ((l * st.scale).round() as i64).clamp(0, iw as i64 - 1) as u32;
+    let pt = ((t * st.scale).round() as i64).clamp(0, ih as i64 - 1) as u32;
+    let pr = ((r * st.scale).round() as i64).clamp(0, iw as i64) as u32;
+    let pb = ((b * st.scale).round() as i64).clamp(0, ih as i64) as u32;
+    let w = pr.saturating_sub(pl).max(1);
+    let h = pb.saturating_sub(pt).max(1);
+    image::imageops::crop_imm(&st.img, pl, pt, w, h).to_image()
+}
+
+fn crop_to_png_bytes(st: &State, rect: Rect) -> Option<Vec<u8>> {
+    let cropped = crop_rect(st, rect);
+    let mut buf = Cursor::new(Vec::new());
+    cropped.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    Some(buf.into_inner())
+}
+
+fn timestamp() -> String {
+    Command::new("date")
+        .arg("+%Y-%m-%d_%H-%M-%S")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "output".to_string())
 }
 
 /// Crops the captured screenshot to `rect` (logical coords) to a temp file
@@ -474,35 +643,17 @@ fn shell_quote(s: &str) -> String {
 /// moment the omasnap process exits, whichever way that happens — spawned
 /// as one shell chain so cleanup runs independently of omaruler's own
 /// lifetime (you may well hit Escape and quit before you're done in
-/// omasnap).
-fn save_selection(st: &State, rect: Rect) {
-    let (l, t, r, b) = rect;
-    let iw = st.img.width();
-    let ih = st.img.height();
-    let pl = ((l * st.scale).round() as i64).clamp(0, iw as i64 - 1) as u32;
-    let pt = ((t * st.scale).round() as i64).clamp(0, ih as i64 - 1) as u32;
-    let pr = ((r * st.scale).round() as i64).clamp(0, iw as i64) as u32;
-    let pb = ((b * st.scale).round() as i64).clamp(0, ih as i64) as u32;
-    let w = pr.saturating_sub(pl).max(1);
-    let h = pb.saturating_sub(pt).max(1);
-
-    let cropped = image::imageops::crop_imm(&st.img, pl, pt, w, h).to_image();
-
-    let ts = Command::new("date")
-        .arg("+%Y-%m-%d_%H-%M-%S")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "output".to_string());
-
-    let path = std::env::temp_dir().join(format!("{}-{}.png", APP_NAME, ts));
+/// omasnap). This is the mouse hover-and-click path; `s`/`c` (below) are a
+/// separate, more direct pair of keyboard shortcuts that skip the editor.
+fn open_in_omasnap(st: &State, rect: Rect) {
+    let cropped = crop_rect(st, rect);
+    let path = std::env::temp_dir().join(format!("{}-{}.png", APP_NAME, timestamp()));
     let Some(path) = path.to_str() else {
-        notify(APP_NAME, "Failed to save image");
+        flash_status("Failed to open image");
         return;
     };
     if cropped.save(path).is_err() {
-        notify(APP_NAME, "Failed to save image");
+        flash_status("Failed to open image");
         return;
     }
 
@@ -513,6 +664,40 @@ fn save_selection(st: &State, rect: Rect) {
         .spawn();
 }
 
+/// `s` on an active selection: crop straight to ~/Pictures/Screenshots, no
+/// editor detour. Matches Omarchy's own screenshot-tool naming convention.
+fn save_selection_direct(st: &State, rect: Rect) {
+    let Ok(home) = std::env::var("HOME") else {
+        flash_status("Could not resolve $HOME");
+        return;
+    };
+    let dir = format!("{}/Pictures/Screenshots", home);
+    if std::fs::create_dir_all(&dir).is_err() {
+        flash_status("Failed to create Pictures/Screenshots");
+        return;
+    }
+    let path = format!("{}/{}-{}.png", dir, APP_NAME, timestamp());
+    let cropped = crop_rect(st, rect);
+    if cropped.save(&path).is_ok() {
+        copy_to_clipboard(&path);
+        flash_status("Screenshot saved");
+    } else {
+        flash_status("Failed to save image");
+    }
+}
+
+/// `c` on an active selection: crop straight to the clipboard as image
+/// data (`wl-copy --type image/png`), no file written at all.
+fn copy_selection_direct(st: &State, rect: Rect) {
+    match crop_to_png_bytes(st, rect) {
+        Some(bytes) => {
+            copy_image_to_clipboard(&bytes);
+            flash_status("Screenshot copied");
+        }
+        None => flash_status("Failed to copy image"),
+    }
+}
+
 fn point_in_rect(p: (f64, f64), r: Rect) -> bool {
     p.0 >= r.0 && p.0 <= r.2 && p.1 >= r.1 && p.1 <= r.3
 }
@@ -521,12 +706,12 @@ fn point_in_rect(p: (f64, f64), r: Rect) -> bool {
 /// hardware-cursor path, completely separate from our own client-side
 /// redraw — leaving it visible during precision work (hovering or
 /// dragging) means there are always two pointers on screen, and ours will
-/// always look laggy by comparison. Hide it while measuring; once a
-/// rectangle has snapped there's no more precision tracking to do, and a
-/// visible cursor makes it much easier to land a click on the small
-/// hover-to-save box.
+/// always look laggy by comparison. Hide it while measuring; once at least
+/// one rectangle has snapped there's no more precision tracking to do, and
+/// a visible cursor makes it much easier to land a click on the small
+/// hover-to-open box.
 fn sync_cursor_visibility(window: &ApplicationWindow, st: &State) {
-    let visible = st.mode == Mode::Ruler && st.snapped_rect.is_some();
+    let visible = st.mode == Mode::Ruler && !st.snapped_rects.is_empty();
     window.set_cursor_from_name(Some(if visible { "default" } else { "none" }));
 }
 
@@ -601,6 +786,37 @@ fn draw_label_box(cr: &Context, x: f64, y: f64, tw: f64, th: f64, text: &str, th
 fn draw_label(cr: &Context, x: f64, y: f64, text: &str, theme: &Theme) {
     let (tw, th) = measure_text(cr, text);
     draw_label_box(cr, x, y, tw, th, text, theme);
+}
+
+fn rects_overlap(a: Rect, b: Rect) -> bool {
+    a.0 < b.2 && a.2 > b.0 && a.1 < b.3 && a.3 > b.1
+}
+
+/// Draws a themed label, nudging it downward in fixed steps until it
+/// doesn't overlap anything already placed this frame (tracked in
+/// `occupied`, one accumulator per draw() call). Without this, a pinned
+/// measure line's size label and the live hover crosshair's readout can
+/// land right on top of each other whenever they happen to share the same
+/// screen position.
+fn place_label(cr: &Context, occupied: &mut Vec<Rect>, x: f64, y: f64, text: &str, theme: &Theme) -> Rect {
+    let (tw, th) = measure_text(cr, text);
+    let pad = 6.0;
+    let box_w = tw + pad * 2.0;
+    let box_h = th + pad * 2.0;
+    let mut by = y;
+    for _ in 0..20 {
+        let candidate = (x, by, x + box_w, by + box_h);
+        if !occupied.iter().any(|&o| rects_overlap(candidate, o)) {
+            draw_label_box(cr, x, by, tw, th, text, theme);
+            occupied.push(candidate);
+            return candidate;
+        }
+        by += box_h + 4.0;
+    }
+    let candidate = (x, by, x + box_w, by + box_h);
+    draw_label_box(cr, x, by, tw, th, text, theme);
+    occupied.push(candidate);
+    candidate
 }
 
 /// A small hand-drawn camera glyph (no emoji font fallback needed), centered
@@ -731,6 +947,79 @@ fn draw_extent_bars(cr: &Context, theme: &Theme, cx: f64, cy: f64, l: f64, r: f6
     let _ = cr.fill();
 }
 
+/// A pinned horizontal measure line — bounded to its own extent (unlike a
+/// guide, which spans the full screen), with the size centered above it.
+fn draw_pinned_h(cr: &Context, theme: &Theme, occupied: &mut Vec<Rect>, line: HLine) {
+    let (y, l, r) = line;
+    let ac = theme.accent;
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.95);
+    cr.set_line_width(1.5);
+    cr.move_to(l, y);
+    cr.line_to(r, y);
+    let _ = cr.stroke();
+    for tx in [l, r] {
+        cr.move_to(tx, y - 5.0);
+        cr.line_to(tx, y + 5.0);
+        let _ = cr.stroke();
+    }
+    let text = format!("{:.0}px", r - l);
+    let (tw, th) = measure_text(cr, &text);
+    let pad = 6.0;
+    let bx = (l + r) / 2.0 - (tw + pad * 2.0) / 2.0;
+    let by = y - th - pad * 2.0 - 8.0;
+    place_label(cr, occupied, bx, by, &text, theme);
+}
+
+/// A pinned vertical measure line, label to the right, vertically centered.
+fn draw_pinned_v(cr: &Context, theme: &Theme, occupied: &mut Vec<Rect>, line: VLine) {
+    let (x, t, b) = line;
+    let ac = theme.accent;
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.95);
+    cr.set_line_width(1.5);
+    cr.move_to(x, t);
+    cr.line_to(x, b);
+    let _ = cr.stroke();
+    for ty in [t, b] {
+        cr.move_to(x - 5.0, ty);
+        cr.line_to(x + 5.0, ty);
+        let _ = cr.stroke();
+    }
+    let text = format!("{:.0}px", b - t);
+    place_label(cr, occupied, x + 10.0, (t + b) / 2.0, &text, theme);
+}
+
+fn draw_guide_h(cr: &Context, theme: &Theme, y: f64, screen_w: i32) {
+    let gc = theme.guide;
+    cr.set_source_rgba(gc.0, gc.1, gc.2, 0.7);
+    cr.set_line_width(1.0);
+    cr.move_to(0.0, y);
+    cr.line_to(screen_w as f64, y);
+    let _ = cr.stroke();
+}
+
+fn draw_guide_v(cr: &Context, theme: &Theme, x: f64, screen_h: i32) {
+    let gc = theme.guide;
+    cr.set_source_rgba(gc.0, gc.1, gc.2, 0.7);
+    cr.set_line_width(1.0);
+    cr.move_to(x, 0.0);
+    cr.line_to(x, screen_h as f64);
+    let _ = cr.stroke();
+}
+
+/// Shift held, no h/v: full-screen crosshair with no color computation and
+/// no size readout — pure visual eye alignment, not a measurement.
+fn draw_alignment_lines(cr: &Context, theme: &Theme, cx: f64, cy: f64, screen_w: i32, screen_h: i32) {
+    let fg = theme.foreground;
+    cr.set_source_rgba(fg.0, fg.1, fg.2, 0.6);
+    cr.set_line_width(1.0);
+    cr.move_to(cx, 0.0);
+    cr.line_to(cx, screen_h as f64);
+    let _ = cr.stroke();
+    cr.move_to(0.0, cy);
+    cr.line_to(screen_w as f64, cy);
+    let _ = cr.stroke();
+}
+
 fn draw_rect_shape(cr: &Context, theme: &Theme, rect: Rect) {
     let (l, t, r, b) = rect;
     let ac = theme.accent;
@@ -775,6 +1064,46 @@ fn place_size_box(cr: &Context, theme: &Theme, rect: Rect, text: &str, show_rati
     bounds
 }
 
+/// Draws one pinned selection rectangle: outline, size label (centered
+/// inside it or below, whichever fits), and aspect ratio. Only the
+/// `interactive` (most recent) selection swaps its size box for a camera
+/// icon on hover and reports its bounds back for click-hit-testing — with
+/// several selections on screen, only the newest one has an
+/// affordance to "open in omasnap"; `s`/`c` (keyboard) are the more direct
+/// way to act on it regardless of hover.
+fn draw_selection_rect(cr: &Context, st: &State, rect: Rect, interactive: bool, cx: f64, cy: f64) -> Option<Rect> {
+    draw_rect_shape(cr, &st.theme, rect);
+    let (l, t, r, b) = rect;
+    let size_text = format!("{:.0} x {:.0}", r - l, b - t);
+    let (tw, th) = measure_text(cr, &size_text);
+    let pad = 6.0;
+    let (rect_w, rect_h) = (r - l, b - t);
+    let (box_w, box_h) = (tw + pad * 2.0, th + pad * 2.0);
+    let (bx, by) = if box_w + 8.0 <= rect_w && box_h + 8.0 <= rect_h {
+        (l + (rect_w - box_w) / 2.0, t + (rect_h - box_h) / 2.0)
+    } else {
+        (l + (rect_w - box_w) / 2.0, b + 10.0)
+    };
+    let bounds = (bx, by, bx + box_w, by + box_h);
+
+    if interactive && point_in_rect((cx, cy), bounds) {
+        draw_camera_box(cr, bx, by, tw, th, &st.theme);
+    } else {
+        draw_label_box(cr, bx, by, tw, th, &size_text, &st.theme);
+    }
+
+    if let Some((num, den, exact)) = best_ratio(rect_w, rect_h) {
+        let prefix = if exact { "" } else { "~" };
+        let rtext = format!("{}{}:{}", prefix, num, den);
+        let (rtw, rth) = measure_text(cr, &rtext);
+        let stack_bottom = bounds.3.max(b);
+        let rx = l + (rect_w - (rtw + pad * 2.0)) / 2.0;
+        draw_label_box(cr, rx, stack_bottom + 8.0, rtw, rth, &rtext, &st.theme);
+    }
+
+    if interactive { Some(bounds) } else { None }
+}
+
 fn draw(cr: &Context, w: i32, h: i32, st: &State) -> Option<Rect> {
     // The screenshot itself is painted by a GdkTexture-backed Picture widget
     // underneath this transparent DrawingArea (composited by GSK, effectively
@@ -787,49 +1116,48 @@ fn draw(cr: &Context, w: i32, h: i32, st: &State) -> Option<Rect> {
 
     match st.mode {
         Mode::Ruler => {
-            if let Some(rect) = st.snapped_rect {
-                draw_rect_shape(cr, &st.theme, rect);
-                let (l, t, r, b) = rect;
-                let size_text = format!("{:.0} x {:.0}", r - l, b - t);
-                let (tw, th) = measure_text(cr, &size_text);
-                let pad = 6.0;
-                let (rect_w, rect_h) = (r - l, b - t);
-                let (box_w, box_h) = (tw + pad * 2.0, th + pad * 2.0);
-                let (bx, by) = if box_w + 8.0 <= rect_w && box_h + 8.0 <= rect_h {
-                    (l + (rect_w - box_w) / 2.0, t + (rect_h - box_h) / 2.0)
-                } else {
-                    (l + (rect_w - box_w) / 2.0, b + 10.0)
-                };
-                let bounds = (bx, by, bx + box_w, by + box_h);
+            // Tracks every label box placed this frame so pinned lines'
+            // readouts and the live crosshair box can steer clear of each
+            // other instead of stacking on top of one another.
+            let mut occupied: Vec<Rect> = Vec::new();
 
-                if point_in_rect((cx, cy), bounds) {
-                    draw_camera_box(cr, bx, by, tw, th, &st.theme);
-                } else {
-                    draw_label_box(cr, bx, by, tw, th, &size_text, &st.theme);
-                }
-                hover_box = Some(bounds);
+            for &gy in &st.guides_h {
+                draw_guide_h(cr, &st.theme, gy, w);
+            }
+            for &gx in &st.guides_v {
+                draw_guide_v(cr, &st.theme, gx, h);
+            }
+            for &line in &st.measure_lines_h {
+                draw_pinned_h(cr, &st.theme, &mut occupied, line);
+            }
+            for &line in &st.measure_lines_v {
+                draw_pinned_v(cr, &st.theme, &mut occupied, line);
+            }
 
-                if let Some((num, den, exact)) = best_ratio(rect_w, rect_h) {
-                    let prefix = if exact { "" } else { "~" };
-                    let rtext = format!("{}{}:{}", prefix, num, den);
-                    let (rtw, rth) = measure_text(cr, &rtext);
-                    let stack_bottom = bounds.3.max(b);
-                    let rx = l + (rect_w - (rtw + pad * 2.0)) / 2.0;
-                    draw_label_box(cr, rx, stack_bottom + 8.0, rtw, rth, &rtext, &st.theme);
+            let n = st.snapped_rects.len();
+            for (i, &rect) in st.snapped_rects.iter().enumerate() {
+                let interactive = i + 1 == n;
+                let hb = draw_selection_rect(cr, st, rect, interactive, cx, cy);
+                if hb.is_some() {
+                    hover_box = hb;
                 }
-            } else if st.dragging {
+            }
+
+            if st.dragging {
                 if let Some(start) = st.start {
                     let rect = (start.0.min(cx), start.1.min(cy), start.0.max(cx), start.1.max(cy));
                     draw_rect_shape(cr, &st.theme, rect);
                     let text = format!("{:.0} x {:.0}", rect.2 - rect.0, rect.3 - rect.1);
                     place_size_box(cr, &st.theme, rect, &text, true);
                 }
+            } else if st.shift_held {
+                draw_alignment_lines(cr, &st.theme, cx, cy, w, h);
             } else {
                 let (l, t, r, b) = scan_extent_logical(st, cx, cy);
                 draw_extent_bars(cr, &st.theme, cx, cy, l, r, t, b);
-                draw_label(cr, cx + 18.0, cy + 18.0, &format!("{:.0} x {:.0}", r - l, b - t), &st.theme);
+                let text = format!("{:.0} x {:.0}", r - l, b - t);
+                place_label(cr, &mut occupied, cx + 18.0, cy + 18.0, &text, &st.theme);
             }
-
         }
         Mode::Color => {
             draw_loupe(cr, st, cx, cy, w, h);
@@ -898,14 +1226,21 @@ fn build_ui(app: &Application) {
         scale: monitor.scale,
         theme,
         cursor: (0.0, 0.0),
+        last_raw_cursor: (0.0, 0.0),
         mode: Mode::Ruler,
         dragging: false,
         start: None,
-        snapped_rect: None,
+        snapped_rects: Vec::new(),
         hover_box: None,
         snap_enabled: true,
         tolerance_level: DEFAULT_TOLERANCE_LEVEL,
         show_legend: true,
+        shift_held: false,
+        measure_lines_h: Vec::new(),
+        measure_lines_v: Vec::new(),
+        guides_h: Vec::new(),
+        guides_v: Vec::new(),
+        undo_stack: Vec::new(),
         last_message: None,
     }));
 
@@ -941,8 +1276,12 @@ fn build_ui(app: &Application) {
     // delivered a frame late), poll the seat's live pointer position once
     // per compositor frame via the frame clock. This decouples our redraw
     // from event delivery entirely: every frame draws wherever the pointer
-    // truly is *right now*, which is what actually removes the perceived
-    // lag rather than just making the redraw itself cheaper.
+    // truly is *right now*. It also only syncs `cursor` from the mouse when
+    // the raw polled position actually changed since last frame — arrow-key
+    // nudges set `cursor` directly and are otherwise indistinguishable from
+    // "the mouse didn't move", so this is what lets a keyboard nudge stick
+    // instead of being clobbered by the next frame's poll of an unmoved
+    // mouse.
     {
         let state = state.clone();
         area.add_tick_callback(move |area, _clock| {
@@ -951,18 +1290,22 @@ fn build_ui(app: &Application) {
                 if let Some(device) = display.default_seat().and_then(|s| s.pointer()) {
                     if let Some((x, y, _mask)) = surface.device_position(&device) {
                         let mut st = state.borrow_mut();
-                        let cursor = if st.snap_enabled {
-                            let px = x * st.scale;
-                            let py = y * st.scale;
-                            let (snx, sny) = snap_point(&st.grad, st.gw, st.gh, px, py, 6, 40.0);
-                            (snx / st.scale, sny / st.scale)
-                        } else {
-                            (x, y)
-                        };
-                        if st.cursor != cursor {
-                            st.cursor = cursor;
-                            drop(st);
-                            area.queue_draw();
+                        let raw_changed = (x, y) != st.last_raw_cursor;
+                        st.last_raw_cursor = (x, y);
+                        if raw_changed {
+                            let cursor = if st.snap_enabled {
+                                let px = x * st.scale;
+                                let py = y * st.scale;
+                                let (snx, sny) = snap_point(&st.grad, st.gw, st.gh, px, py, 6, 40.0);
+                                (snx / st.scale, sny / st.scale)
+                            } else {
+                                (x, y)
+                            };
+                            if st.cursor != cursor {
+                                st.cursor = cursor;
+                                drop(st);
+                                area.queue_draw();
+                            }
                         }
                     }
                 }
@@ -981,14 +1324,13 @@ fn build_ui(app: &Application) {
             let mut st = state.borrow_mut();
             match st.mode {
                 Mode::Ruler => {
-                    let hovering_save = st.snapped_rect.is_some()
+                    let hovering_open = !st.snapped_rects.is_empty()
                         && st.hover_box.map_or(false, |hb| point_in_rect(st.cursor, hb));
-                    if hovering_save {
-                        if let Some(rect) = st.snapped_rect {
-                            save_selection(&st, rect);
+                    if hovering_open {
+                        if let Some(&rect) = st.snapped_rects.last() {
+                            open_in_omasnap(&st, rect);
                         }
                     } else {
-                        st.snapped_rect = None;
                         st.start = Some(st.cursor);
                         st.dragging = true;
                     }
@@ -1030,8 +1372,9 @@ fn build_ui(app: &Application) {
                         );
                         let tol = TOLERANCE_LEVELS[st.tolerance_level].0;
                         let (nl, nt, nr, nb) = shrink_rect(&st.img, prect, tol);
-                        st.snapped_rect =
-                            Some((nl as f64 / scale, nt as f64 / scale, nr as f64 / scale, nb as f64 / scale));
+                        st.snapped_rects.push((nl as f64 / scale, nt as f64 / scale, nr as f64 / scale, nb as f64 / scale));
+                        st.undo_stack.push(UndoItem::Rect);
+                        refresh_legend(&st);
                     }
                 }
                 st.start = None;
@@ -1048,15 +1391,30 @@ fn build_ui(app: &Application) {
         let state = state.clone();
         let window = window.clone();
         let area = area.clone();
-        key.connect_key_pressed(move |_c, keyval, _keycode, _modifier| {
+        key.connect_key_pressed(move |_c, keyval, _keycode, modifier| {
+            let shift = modifier.contains(gdk::ModifierType::SHIFT_MASK);
+            let ctrl = modifier.contains(gdk::ModifierType::CONTROL_MASK);
             match keyval {
                 gdk::Key::Escape => {
                     let mut st = state.borrow_mut();
-                    if st.mode == Mode::Ruler && (st.dragging || st.snapped_rect.is_some()) {
+                    let has_anything = st.mode == Mode::Ruler
+                        && (st.dragging
+                            || !st.snapped_rects.is_empty()
+                            || !st.guides_h.is_empty()
+                            || !st.guides_v.is_empty()
+                            || !st.measure_lines_h.is_empty()
+                            || !st.measure_lines_v.is_empty());
+                    if has_anything {
                         st.dragging = false;
                         st.start = None;
-                        st.snapped_rect = None;
+                        st.snapped_rects.clear();
+                        st.guides_h.clear();
+                        st.guides_v.clear();
+                        st.measure_lines_h.clear();
+                        st.measure_lines_v.clear();
+                        st.undo_stack.clear();
                         sync_cursor_visibility(&window, &st);
+                        refresh_legend(&st);
                         drop(st);
                         area.queue_draw();
                     } else {
@@ -1067,27 +1425,33 @@ fn build_ui(app: &Application) {
                 }
                 gdk::Key::c | gdk::Key::C => {
                     let mut st = state.borrow_mut();
+                    if st.mode == Mode::Ruler && !st.snapped_rects.is_empty() {
+                        if let Some(&rect) = st.snapped_rects.last() {
+                            copy_selection_direct(&st, rect);
+                        }
+                        drop(st);
+                        return glib::Propagation::Stop;
+                    }
                     st.mode = if st.mode == Mode::Ruler { Mode::Color } else { Mode::Ruler };
                     st.dragging = false;
                     st.start = None;
-                    st.snapped_rect = None;
+                    st.snapped_rects.clear();
                     st.last_message = None;
                     sync_cursor_visibility(&window, &st);
-                    let now_ruler = st.mode == Mode::Ruler;
-                    let show_legend = st.show_legend;
+                    refresh_legend(&st);
                     drop(st);
-                    if now_ruler {
-                        if show_legend {
-                            show_legend_card();
-                        }
-                    } else {
-                        hide_legend_card();
-                    }
                     area.queue_draw();
                     glib::Propagation::Stop
                 }
                 gdk::Key::s | gdk::Key::S => {
                     let mut st = state.borrow_mut();
+                    if st.mode == Mode::Ruler && !st.snapped_rects.is_empty() {
+                        if let Some(&rect) = st.snapped_rects.last() {
+                            save_selection_direct(&st, rect);
+                        }
+                        drop(st);
+                        return glib::Propagation::Stop;
+                    }
                     st.snap_enabled = !st.snap_enabled;
                     drop(st);
                     area.queue_draw();
@@ -1097,8 +1461,34 @@ fn build_ui(app: &Application) {
                     let mut st = state.borrow_mut();
                     st.start = None;
                     st.dragging = false;
-                    st.snapped_rect = None;
+                    st.snapped_rects.clear();
+                    st.guides_h.clear();
+                    st.guides_v.clear();
+                    st.measure_lines_h.clear();
+                    st.measure_lines_v.clear();
+                    st.undo_stack.clear();
                     sync_cursor_visibility(&window, &st);
+                    refresh_legend(&st);
+                    drop(st);
+                    area.queue_draw();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::z | gdk::Key::Z => {
+                    if !ctrl {
+                        return glib::Propagation::Proceed;
+                    }
+                    let mut st = state.borrow_mut();
+                    if let Some(item) = st.undo_stack.pop() {
+                        match item {
+                            UndoItem::Rect => { st.snapped_rects.pop(); }
+                            UndoItem::GuideH => { st.guides_h.pop(); }
+                            UndoItem::GuideV => { st.guides_v.pop(); }
+                            UndoItem::MeasureH => { st.measure_lines_h.pop(); }
+                            UndoItem::MeasureV => { st.measure_lines_v.pop(); }
+                        }
+                    }
+                    sync_cursor_visibility(&window, &st);
+                    refresh_legend(&st);
                     drop(st);
                     area.queue_draw();
                     glib::Propagation::Stop
@@ -1112,20 +1502,126 @@ fn build_ui(app: &Application) {
                     area.queue_draw();
                     glib::Propagation::Stop
                 }
+                gdk::Key::minus | gdk::Key::underscore => {
+                    let mut st = state.borrow_mut();
+                    st.tolerance_level = st.tolerance_level.saturating_sub(1);
+                    let name = TOLERANCE_LEVELS[st.tolerance_level].1;
+                    drop(st);
+                    flash_tolerance(name);
+                    area.queue_draw();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::equal | gdk::Key::plus => {
+                    let mut st = state.borrow_mut();
+                    st.tolerance_level = (st.tolerance_level + 1).min(TOLERANCE_LEVELS.len() - 1);
+                    let name = TOLERANCE_LEVELS[st.tolerance_level].1;
+                    drop(st);
+                    flash_tolerance(name);
+                    area.queue_draw();
+                    glib::Propagation::Stop
+                }
                 gdk::Key::l | gdk::Key::L => {
                     let mut st = state.borrow_mut();
                     st.show_legend = !st.show_legend;
-                    let show_legend = st.show_legend;
+                    refresh_legend(&st);
                     drop(st);
-                    if show_legend {
-                        show_legend_card();
-                    } else {
-                        hide_legend_card();
+                    area.queue_draw();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::h | gdk::Key::H => {
+                    let mut st = state.borrow_mut();
+                    if st.mode != Mode::Ruler {
+                        return glib::Propagation::Proceed;
                     }
+                    if shift {
+                        let px = (st.cursor.0 * st.scale).round() as i64;
+                        let py = (st.cursor.1 * st.scale).round() as i64;
+                        let tol = TOLERANCE_LEVELS[st.tolerance_level].0;
+                        let snapped = nearest_edge_vertical(&st.img, px, py, tol);
+                        let y = snapped as f64 / st.scale;
+                        st.guides_h.push(y);
+                        st.undo_stack.push(UndoItem::GuideH);
+                    } else {
+                        let (l, _t, r, _b) = scan_extent_logical(&st, st.cursor.0, st.cursor.1);
+                        let y = st.cursor.1;
+                        st.measure_lines_h.push((y, l, r));
+                        st.undo_stack.push(UndoItem::MeasureH);
+                    }
+                    drop(st);
+                    area.queue_draw();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::v | gdk::Key::V => {
+                    let mut st = state.borrow_mut();
+                    if st.mode != Mode::Ruler {
+                        return glib::Propagation::Proceed;
+                    }
+                    if shift {
+                        let px = (st.cursor.0 * st.scale).round() as i64;
+                        let py = (st.cursor.1 * st.scale).round() as i64;
+                        let tol = TOLERANCE_LEVELS[st.tolerance_level].0;
+                        let snapped = nearest_edge_horizontal(&st.img, px, py, tol);
+                        let x = snapped as f64 / st.scale;
+                        st.guides_v.push(x);
+                        st.undo_stack.push(UndoItem::GuideV);
+                    } else {
+                        let (_l, t, _r, b) = scan_extent_logical(&st, st.cursor.0, st.cursor.1);
+                        let x = st.cursor.0;
+                        st.measure_lines_v.push((x, t, b));
+                        st.undo_stack.push(UndoItem::MeasureV);
+                    }
+                    drop(st);
+                    area.queue_draw();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Shift_L | gdk::Key::Shift_R => {
+                    state.borrow_mut().shift_held = true;
+                    area.queue_draw();
+                    glib::Propagation::Proceed
+                }
+                gdk::Key::Up => {
+                    let mut st = state.borrow_mut();
+                    let step = if shift { 10.0 } else { 1.0 };
+                    st.cursor.1 -= step;
+                    drop(st);
+                    area.queue_draw();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Down => {
+                    let mut st = state.borrow_mut();
+                    let step = if shift { 10.0 } else { 1.0 };
+                    st.cursor.1 += step;
+                    drop(st);
+                    area.queue_draw();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Left => {
+                    let mut st = state.borrow_mut();
+                    let step = if shift { 10.0 } else { 1.0 };
+                    st.cursor.0 -= step;
+                    drop(st);
+                    area.queue_draw();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Right => {
+                    let mut st = state.borrow_mut();
+                    let step = if shift { 10.0 } else { 1.0 };
+                    st.cursor.0 += step;
+                    drop(st);
                     area.queue_draw();
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        let area = area.clone();
+        key.connect_key_released(move |_c, keyval, _keycode, _modifier| {
+            if matches!(keyval, gdk::Key::Shift_L | gdk::Key::Shift_R) {
+                state.borrow_mut().shift_held = false;
+                area.queue_draw();
             }
         });
     }
@@ -1143,7 +1639,7 @@ fn build_ui(app: &Application) {
     window.set_child(Some(&overlay));
     window.present();
     if state.borrow().show_legend {
-        show_legend_card();
+        show_legend_idle();
     }
 }
 

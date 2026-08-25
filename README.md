@@ -49,12 +49,38 @@ each of the box's 4 edges independently shrinks inward — using the majority
 background color it's sitting on as its own reference — until the *entire*
 row or column stops matching, the same idea as ImageMagick's `-trim -fuzz` or
 GIMP's Autocrop. A loose box around an object on a plain background ends up
-snapped tight to the object.
+snapped tight to the object. The live crosshair stays active while a
+rectangle is snapped, so you can keep dragging out more rectangles to compare
+several elements at once — each one keeps its own snap-to-content result.
 
-**Hover the snapped box**: once a rectangle has snapped, hovering its size
-readout swaps it to a camera icon — click to crop the screenshot to that
-rectangle and save it to `~/Pictures/Screenshots/omaruler-<timestamp>.png`
-(path copied to clipboard, confirmed by notification).
+**Hover the last snapped box**: hovering its size readout swaps it to a
+camera icon — click to open the crop in `omasnap`'s editor. With a selection
+active, `c` copies it straight to the clipboard and `s` saves it to
+`~/Pictures/Screenshots/omaruler-<timestamp>.png` (path copied to clipboard),
+each confirmed by a flashed `omarchy-osd` message instead of a desktop
+notification.
+
+**Pinned measure lines** (`h` / `v`): drop a horizontal or vertical line at
+the cursor, auto-extended by color continuity the same way the idle
+crosshair is, with its length labeled above/beside it. Lines stay on screen
+so you can pin several at once and read them all together; labels nudge
+out of each other's way if two would otherwise overlap.
+
+**Guides** (Shift+`h` / Shift+`v`): pin a plain alignment guide — no
+measurement, just a line — snapped to the nearest actual color change in
+that axis (top/bottom for a horizontal guide, left/right for a vertical
+one), rendered in a distinct color from measure lines. Guides also bound
+every other measurement: the idle crosshair and pinned measure lines will
+stop at the nearest guide instead of reading past it, even where there's no
+real color change there.
+
+**Alignment lines** (hold Shift): a full-screen crosshair through the
+cursor for eyeballing visual alignment — no color sampling, no readout, just
+two lines. Disappears the moment Shift is released.
+
+**Nudge the cursor**: arrow keys move it 1px at a time; hold Shift for
+10px steps. Useful for lining a measurement or guide up exactly once you're
+close.
 
 **Color mode** (`c`): magnified pixel loupe with hex readout; click to copy.
 
@@ -63,15 +89,25 @@ rectangle and save it to `~/Pictures/Screenshots/omaruler-<timestamp>.png`
 | Input | Action |
 |---|---|
 | Hover | Live padding/gap measurement (auto color-continuity extent) |
-| Click + drag | Draw a selection rectangle, snaps to content on release |
-| Hover snapped box | Shows a camera button — click to save that area as a PNG |
-| `t` | Cycle color tolerance: off / low / med / high (flashed via `omarchy-osd`) |
-| `c` | Toggle color-picker mode (magnified pixel loupe) |
+| Click + drag | Draw a selection rectangle, snaps to content on release — repeatable for multi-select |
+| Hover snapped box | Shows a camera button — click to open in `omasnap` |
+| `h` / `v` | Pin a horizontal / vertical measure line at the cursor |
+| Shift+`h` / Shift+`v` | Pin a horizontal / vertical guide, snapped to the nearest color edge |
+| Hold Shift | Full-screen alignment crosshair (no measurement) |
+| Arrow keys | Nudge cursor 1px (hold Shift for 10px) |
+| `c` | Copy the active selection, or toggle color-picker mode if none |
+| `s` | Save the active selection to disk, or toggle cursor edge-snapping if none |
 | Click (color mode) | Copy the hex color under the cursor |
-| `s` | Toggle cursor edge-snapping |
-| `r` | Reset current selection |
+| `t` | Cycle color tolerance: off / low / med / high |
+| `-` / `=` | Step color tolerance down / up |
+| `Ctrl+Z` | Undo the last pinned line, guide, or rectangle |
+| `r` | Reset all selections, lines, and guides |
 | `l` | Show/hide the hint legend (`omarchy-legend`) |
-| `Escape` | Reset an active selection, or quit if idle |
+| `Escape` | Clear all selections, lines, and guides if any exist, else quit |
+
+Tolerance changes and saved/copied screenshots are all flashed via
+`omarchy-osd` rather than a desktop notification, matching how the rest of
+the Omarchy shell surfaces transient state.
 
 ## Build
 
@@ -99,5 +135,6 @@ have never had a Print Screen key.
   selection can't be dragged across a monitor boundary.
 - The shrink-to-fit step assumes a reasonably uniform background near each
   edge; it won't do well against a busy/textured background.
-- No multi-element alignment detection (PixelSnap's "smart guides" across
-  several elements at once).
+- Guides and measure lines snap to color edges the same way the cursor
+  does — there's no layout/DOM awareness, so a busy background can produce
+  a guide in the wrong place, same caveat as the shrink-to-fit step.
