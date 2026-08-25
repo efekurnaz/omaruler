@@ -29,8 +29,8 @@ enum Mode {
     Color,
     /// Placing a horizontal guide: a live line follows the cursor's Y, with
     /// the space above/below it read out on the left edge of the screen,
-    /// until a click commits it (snapped to the nearest color edge) and
-    /// mode returns to Ruler.
+    /// until a click commits it (at the exact cursor position — no
+    /// color-edge snapping) and mode returns to Ruler.
     GuideH,
     /// The vertical-guide counterpart: line follows cursor X, readouts on
     /// the top edge.
@@ -415,61 +415,6 @@ fn color_close(img: &RgbaImage, x: i64, y: i64, w: i64, h: i64, reference: (u8, 
     (r as i32 - reference.0 as i32).abs() <= tol
         && (g as i32 - reference.1 as i32).abs() <= tol
         && (b as i32 - reference.2 as i32).abs() <= tol
-}
-
-/// Where a horizontal guide placed at (px, py) should actually land: walk
-/// up and down from the reference color at that point until it changes in
-/// each direction, then snap to whichever of those two edges (top or
-/// bottom) is closer — not just wherever the general edge-magnet cursor
-/// snap happened to leave the pointer.
-fn nearest_edge_vertical(img: &RgbaImage, px: i64, py: i64, tol: u8) -> i64 {
-    let w = img.width() as i64;
-    let h = img.height() as i64;
-    if px < 0 || py < 0 || px >= w || py >= h {
-        return py;
-    }
-    let (rr, rg, rb, _) = rgba_at(img, px as u32, py as u32);
-    let close = |y: i64| color_close(img, px, y, w, h, (rr, rg, rb), tol);
-
-    let mut top = py;
-    let mut steps = 0;
-    while steps < MAX_EXTENT_SCAN && close(top - 1) {
-        top -= 1;
-        steps += 1;
-    }
-    let mut bottom = py;
-    steps = 0;
-    while steps < MAX_EXTENT_SCAN && close(bottom + 1) {
-        bottom += 1;
-        steps += 1;
-    }
-    if py - top <= bottom - py { top } else { bottom }
-}
-
-/// The horizontal-axis counterpart: nearest edge to the left or right,
-/// whichever is closer, for a vertical guide.
-fn nearest_edge_horizontal(img: &RgbaImage, px: i64, py: i64, tol: u8) -> i64 {
-    let w = img.width() as i64;
-    let h = img.height() as i64;
-    if px < 0 || py < 0 || px >= w || py >= h {
-        return px;
-    }
-    let (rr, rg, rb, _) = rgba_at(img, px as u32, py as u32);
-    let close = |x: i64| color_close(img, x, py, w, h, (rr, rg, rb), tol);
-
-    let mut left = px;
-    let mut steps = 0;
-    while steps < MAX_EXTENT_SCAN && close(left - 1) {
-        left -= 1;
-        steps += 1;
-    }
-    let mut right = px;
-    steps = 0;
-    while steps < MAX_EXTENT_SCAN && close(right + 1) {
-        right += 1;
-        steps += 1;
-    }
-    if px - left <= right - px { left } else { right }
 }
 
 /// Same walk as `scan_extent`, in the drawing area's logical coordinate
@@ -1521,22 +1466,17 @@ fn build_ui(app: &Application) {
                     }
                 }
                 Mode::GuideH => {
-                    let px = (st.cursor.0 * st.scale).round() as i64;
-                    let py = (st.cursor.1 * st.scale).round() as i64;
-                    let tol = TOLERANCE_LEVELS[st.tolerance_level].0;
-                    let snapped = nearest_edge_vertical(&st.img, px, py, tol);
-                    let y = snapped as f64 / st.scale;
+                    // No color-edge snapping here (for now) — it was landing
+                    // guides in surprising places on noisy/gradient
+                    // backgrounds. Placed exactly where the cursor is.
+                    let y = st.cursor.1;
                     st.guides_h.push(y);
                     st.undo_stack.push(UndoItem::GuideH);
                     st.mode = Mode::Ruler;
                     refresh_legend(&st);
                 }
                 Mode::GuideV => {
-                    let px = (st.cursor.0 * st.scale).round() as i64;
-                    let py = (st.cursor.1 * st.scale).round() as i64;
-                    let tol = TOLERANCE_LEVELS[st.tolerance_level].0;
-                    let snapped = nearest_edge_horizontal(&st.img, px, py, tol);
-                    let x = snapped as f64 / st.scale;
+                    let x = st.cursor.0;
                     st.guides_v.push(x);
                     st.undo_stack.push(UndoItem::GuideV);
                     st.mode = Mode::Ruler;
@@ -1738,14 +1678,21 @@ fn build_ui(app: &Application) {
                 }
                 gdk::Key::h | gdk::Key::H => {
                     let mut st = state.borrow_mut();
-                    if st.mode != Mode::Ruler {
-                        return glib::Propagation::Proceed;
-                    }
                     if shift {
+                        // Allowed from Ruler or from the other guide axis —
+                        // so switching straight from placing a vertical
+                        // guide to a horizontal one doesn't require
+                        // escaping/committing first.
+                        if !matches!(st.mode, Mode::Ruler | Mode::GuideH | Mode::GuideV) {
+                            return glib::Propagation::Proceed;
+                        }
                         st.mode = Mode::GuideH;
                         sync_cursor_visibility(&window, &st);
                         refresh_legend(&st);
                     } else {
+                        if st.mode != Mode::Ruler {
+                            return glib::Propagation::Proceed;
+                        }
                         let (l, _t, r, _b) = scan_extent_logical(&st, st.cursor.0, st.cursor.1);
                         let y = st.cursor.1;
                         st.measure_lines_h.push((y, l, r));
@@ -1757,14 +1704,17 @@ fn build_ui(app: &Application) {
                 }
                 gdk::Key::v | gdk::Key::V => {
                     let mut st = state.borrow_mut();
-                    if st.mode != Mode::Ruler {
-                        return glib::Propagation::Proceed;
-                    }
                     if shift {
+                        if !matches!(st.mode, Mode::Ruler | Mode::GuideH | Mode::GuideV) {
+                            return glib::Propagation::Proceed;
+                        }
                         st.mode = Mode::GuideV;
                         sync_cursor_visibility(&window, &st);
                         refresh_legend(&st);
                     } else {
+                        if st.mode != Mode::Ruler {
+                            return glib::Propagation::Proceed;
+                        }
                         let (_l, t, _r, b) = scan_extent_logical(&st, st.cursor.0, st.cursor.1);
                         let x = st.cursor.0;
                         st.measure_lines_v.push((x, t, b));

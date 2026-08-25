@@ -72,14 +72,16 @@ full width (or height) of the screen. While placing, the space on either
 side of the line is read out in small type on the left edge of the screen
 (top edge for a vertical guide), vertically/horizontally centered in each
 segment — same idea as dragging a guide off the ruler in Figma or Sketch.
-Click to commit it: the guide snaps to the nearest actual color change in
-that axis (top/bottom for a horizontal guide, left/right for a vertical
-one) and mode returns to Ruler. `Escape` cancels placement without adding
-one. Guides render in a distinct color from measure lines, and the same
-edge-distance readout stays pinned on screen for every committed guide, not
-just the one being placed. Guides also bound every other measurement: the
-idle crosshair and pinned measure lines will stop at the nearest guide
-instead of reading past it, even where there's no real color change there.
+Click to commit it at the exact cursor position (no color-edge snapping —
+it made for surprising placement on noisy/gradient backgrounds) and mode
+returns to Ruler. Shift+`h`/Shift+`v` also switch directly between the two
+axes without needing to commit or cancel first. `Escape` cancels placement
+without adding one. Guides render in a distinct color from measure lines,
+and the same edge-distance readout stays pinned on screen for every
+committed guide, not just the one being placed. Guides also bound every
+other measurement: the idle crosshair and pinned measure lines will stop at
+the nearest guide instead of reading past it, even where there's no real
+color change there.
 
 **Alignment lines** (hold Shift): a full-screen crosshair through the
 cursor for eyeballing visual alignment — no color sampling, no readout, just
@@ -99,7 +101,7 @@ close.
 | Click + drag | Draw a selection rectangle, snaps to content on release — repeatable for multi-select |
 | Hover snapped box | Shows a camera button — click to open in `omasnap` |
 | `h` / `v` | Pin a horizontal / vertical measure line at the cursor |
-| Shift+`h` / Shift+`v` | Enter guide-placement mode; click to commit (snaps to nearest color edge), `Escape` to cancel |
+| Shift+`h` / Shift+`v` | Enter guide-placement mode (switches axes directly into each other); click to commit at the cursor, `Escape` to cancel |
 | Hold Shift | Full-screen alignment crosshair (no measurement) |
 | Arrow keys | Nudge cursor 1px (hold Shift for 10px) |
 | `c` | Copy the active selection, or toggle color-picker mode if none |
@@ -142,6 +144,9 @@ have never had a Print Screen key.
   selection can't be dragged across a monitor boundary.
 - The shrink-to-fit step assumes a reasonably uniform background near each
   edge; it won't do well against a busy/textured background.
-- Guides and measure lines snap to color edges the same way the cursor
-  does — there's no layout/DOM awareness, so a busy background can produce
-  a guide in the wrong place, same caveat as the shrink-to-fit step.
+- Measure lines snap to color edges the same way the cursor does — there's
+  no layout/DOM awareness, so a busy background can produce one in the
+  wrong place, same caveat as the shrink-to-fit step. Guides don't snap at
+  all right now (placed exactly at the cursor) — color-edge snapping for
+  guides was tried and pulled back for landing in surprising places; may
+  come back in a different form later.
