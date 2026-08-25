@@ -31,6 +31,11 @@ save that selection as an image, or pick a color.
   Themed and positioned by the shell, so they stay in sync with the active
   theme automatically instead of being hand-drawn in Cairo. See
   `shell/plugins/legend/` and `shell/plugins/osd/` in the Omarchy repo.
+  `omarchy-legend` is checked for on `$PATH` once at startup; if it isn't
+  there yet (this app may well land before that shell service does), the
+  exact same hint entries are drawn locally in Cairo instead — same
+  content, just without the shell's theming/hover-flip. `omarchy-osd` has
+  no such fallback since it already ships on stock Omarchy today.
 
 No continuous screen capture, no background daemon — it launches, does its
 job, and exits.
@@ -126,10 +131,10 @@ cp target/release/omaruler ~/.local/bin/
 ```
 
 Requires: `gtk4` (with the GTK C library at 4.8+), `gtk4-layer-shell`,
-`grim`, `wl-copy`, `hyprctl`, `omarchy-theme-color`,
-`omarchy-notification-send` (all present on stock Omarchy), plus
-`omarchy-osd` (stock) and `omarchy-legend` (new — requires the
-`omarchy-legend-service` branch/PR until it lands upstream).
+`grim`, `wl-copy`, `hyprctl`, `omarchy-theme-color`, and `omarchy-osd` (all
+present on stock Omarchy). `omarchy-legend` (new — from the
+`omarchy-legend-service` branch/PR until it lands upstream) is optional:
+Omaruler falls back to drawing the hint card itself when it's missing.
 
 ## Keybind
 

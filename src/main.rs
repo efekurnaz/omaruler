@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Cursor, Write as _};
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 
@@ -97,6 +98,11 @@ struct State {
     snap_enabled: bool,
     tolerance_level: usize,
     show_legend: bool,
+    /// Whether `omarchy-legend` is on PATH, checked once at startup. When
+    /// it isn't (e.g. this app lands before the shell-side legend service
+    /// does), the same hint entries are drawn locally in Cairo instead of
+    /// shelling out — see `legend_entries`/`draw_builtin_legend`.
+    legend_available: bool,
     shift_held: bool,
     measure_lines_h: Vec<HLine>,
     measure_lines_v: Vec<VLine>,
@@ -169,6 +175,23 @@ fn parse_hex_color(s: &str) -> Option<(f64, f64, f64)> {
     Some((r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0))
 }
 
+/// Whether `name` resolves to an executable file somewhere on `$PATH` —
+/// used to detect `omarchy-legend` specifically, since (unlike the rest of
+/// this app's Omarchy dependencies) it's a shell-service companion built
+/// alongside this app rather than something guaranteed present on stock
+/// Omarchy yet. Checked once at startup rather than per-call so behavior
+/// stays consistent for the life of the process.
+fn command_exists(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| {
+        std::fs::metadata(dir.join(name))
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    })
+}
+
 /// Resolves one semantic color from the active Omarchy theme via
 /// `omarchy-theme-color`, which handles the alias/fallback cascade that
 /// every other theme consumer (templates, tmux, GNOME, ...) shares — so
@@ -210,79 +233,91 @@ fn flash_tolerance(level_name: &str) {
     flash_status(&format!("Tolerance: {}", level_name));
 }
 
-/// Shows the shortcut-hint card via Omarchy's `legend` shell service
-/// (companion to `omarchy-osd`, built alongside this feature) instead of
-/// hand-drawing it in Cairo — themed and positioned by the shell itself,
-/// so it looks Omarchy-native for free and stays in sync with the theme
-/// automatically.
-fn show_legend_idle() {
-    let _ = Command::new("omarchy-legend")
-        .args([
-            "-e", "drag:select & snap",
-            "-e", "h/v:measure line",
-            "-e", "shift+h/v:guide",
-            "-e", "ctrl+z:undo",
-            "-e", "t:tolerance",
-            "-e", "c:color",
-            "-e", "l:hide legend",
-            "-c", "top-right",
-        ])
-        .spawn();
-}
+const LEGEND_IDLE: &[(&str, &str)] = &[
+    ("drag", "select & snap"),
+    ("h/v", "measure line"),
+    ("shift+h/v", "guide"),
+    ("ctrl+z", "undo"),
+    ("t", "tolerance"),
+    ("c", "color"),
+    ("l", "hide legend"),
+];
 
 /// Legend shown once at least one selection is pinned — `c`/`s` mean
 /// something different there (copy/save the selection rather than
 /// toggling color mode / edge-snap), so the hint card needs to say so.
-fn show_legend_selection() {
-    let _ = Command::new("omarchy-legend")
-        .args([
-            "-e", "drag:new selection",
-            "-e", "c:copy",
-            "-e", "s:save",
-            "-e", "ctrl+z:undo",
-            "-e", "t:tolerance",
-            "-e", "l:hide legend",
-            "-c", "top-right",
-        ])
-        .spawn();
-}
+const LEGEND_SELECTION: &[(&str, &str)] = &[
+    ("drag", "new selection"),
+    ("c", "copy"),
+    ("s", "save"),
+    ("ctrl+z", "undo"),
+    ("t", "tolerance"),
+    ("l", "hide legend"),
+];
 
 /// Legend shown while placing a guide (`Mode::GuideH`/`GuideV`) — `c`/`s`
 /// and the rest of the idle/selection hints don't apply here, only
 /// committing or canceling the guide do.
-fn show_legend_guide() {
-    let _ = Command::new("omarchy-legend")
-        .args([
-            "-e", "click:place guide",
-            "-e", "esc:cancel",
-            "-c", "top-right",
-        ])
-        .spawn();
-}
+const LEGEND_GUIDE: &[(&str, &str)] = &[("click", "place guide"), ("esc", "cancel")];
 
-fn hide_legend_card() {
-    let _ = Command::new("omarchy-legend").arg("--hide").spawn();
-}
-
-/// Picks the right legend variant (or hides it) for the current state.
-/// Called at every transition that could change which one applies: a
-/// selection being made or cleared, the `l` toggle, entering/leaving Color
-/// or guide-placement mode.
-fn refresh_legend(st: &State) {
+/// The entries the legend should show for the current state, or `None` if
+/// it should be hidden — the single source of truth both the shell-service
+/// dispatch and the built-in Cairo fallback draw from, so the two backends
+/// can never drift out of sync with each other.
+fn legend_entries(st: &State) -> Option<&'static [(&'static str, &'static str)]> {
     if !st.show_legend {
-        hide_legend_card();
-        return;
+        return None;
     }
     match st.mode {
-        Mode::Ruler => {
-            if st.snapped_rects.is_empty() {
-                show_legend_idle();
-            } else {
-                show_legend_selection();
-            }
-        }
-        Mode::GuideH | Mode::GuideV => show_legend_guide(),
-        Mode::Color => hide_legend_card(),
+        Mode::Ruler => Some(if st.snapped_rects.is_empty() { LEGEND_IDLE } else { LEGEND_SELECTION }),
+        Mode::GuideH | Mode::GuideV => Some(LEGEND_GUIDE),
+        Mode::Color => None,
+    }
+}
+
+/// Shows the shortcut-hint card via Omarchy's `legend` shell service
+/// (companion to `omarchy-osd`, built alongside this feature) instead of
+/// hand-drawing it in Cairo — themed and positioned by the shell itself,
+/// so it looks Omarchy-native for free and stays in sync with the theme
+/// automatically. Only called when `State::legend_available` — see
+/// `draw_builtin_legend` for the fallback when the service isn't installed.
+fn show_legend_entries(entries: &[(&str, &str)]) {
+    let mut args: Vec<String> = Vec::new();
+    for (key, action) in entries {
+        args.push("-e".to_string());
+        args.push(format!("{}:{}", key, action));
+    }
+    args.push("-c".to_string());
+    args.push("top-right".to_string());
+    let _ = Command::new("omarchy-legend").args(&args).spawn();
+}
+
+/// Blocks until the hide IPC call actually completes, not just spawns.
+/// Hiding is what should happen right before this app's own frozen-
+/// screenshot overlay disappears (on quit, or any mode switch that drops
+/// the legend) — a fire-and-forget spawn races the window closing, so for
+/// a brief moment the legend would still be showing, now floating over the
+/// real live desktop instead of the overlay, which reads as a flash/blink
+/// right as the app quits. The call itself is a fast local IPC round trip,
+/// so blocking on it is imperceptible.
+fn hide_legend_card() {
+    let _ = Command::new("omarchy-legend").arg("--hide").status();
+}
+
+/// Tells the shell-service legend which entries to show (or hides it) for
+/// the current state. Called at every transition that could change which
+/// entries apply: a selection being made or cleared, the `l` toggle,
+/// entering/leaving Color or guide-placement mode. A no-op when
+/// `omarchy-legend` isn't installed — `draw()` derives the built-in
+/// fallback straight from state every frame instead, so there's nothing to
+/// imperatively push in that case.
+fn refresh_legend(st: &State) {
+    if !st.legend_available {
+        return;
+    }
+    match legend_entries(st) {
+        Some(entries) => show_legend_entries(entries),
+        None => hide_legend_card(),
     }
 }
 
@@ -1206,6 +1241,57 @@ fn draw_selection_rect(cr: &Context, st: &State, rect: Rect, interactive: bool, 
     if interactive { Some(bounds) } else { None }
 }
 
+/// Fallback for when `omarchy-legend` isn't installed (e.g. this app
+/// lands somewhere before the shell-side legend service does): the same
+/// entries `legend_entries` would otherwise hand to the shell, drawn
+/// locally as a plain two-column card in the top-right corner. No
+/// hover-flip-to-the-other-corner like the shell version does — just
+/// enough to not leave the hints missing entirely.
+fn draw_builtin_legend(cr: &Context, theme: &Theme, screen_w: i32, entries: &[(&str, &str)]) {
+    select_font(cr);
+    let pad = 14.0;
+    let row_gap = 10.0;
+    let col_gap = 24.0;
+    let margin = 14.0;
+
+    let mut key_w = 0.0f64;
+    let mut action_w = 0.0f64;
+    let mut row_h = 0.0f64;
+    for (key, action) in entries {
+        let (kw, kh) = measure_text(cr, key);
+        let (aw, ah) = measure_text(cr, action);
+        key_w = key_w.max(kw);
+        action_w = action_w.max(aw);
+        row_h = row_h.max(kh).max(ah);
+    }
+    let content_w = key_w + col_gap + action_w;
+    let content_h = entries.len() as f64 * row_h + entries.len().saturating_sub(1) as f64 * row_gap;
+    let box_w = content_w + pad * 2.0;
+    let box_h = content_h + pad * 2.0;
+    let x = screen_w as f64 - box_w - margin;
+    let y = margin;
+
+    let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
+    cr.set_source_rgba(bg.0, bg.1, bg.2, 0.97);
+    cr.rectangle(x, y, box_w, box_h);
+    let _ = cr.fill();
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.5);
+    cr.set_line_width(1.0);
+    cr.rectangle(x, y, box_w, box_h);
+    let _ = cr.stroke();
+
+    let mut ty = y + pad;
+    for (key, action) in entries {
+        cr.set_source_rgba(ac.0, ac.1, ac.2, 1.0);
+        cr.move_to(x + pad, ty + row_h);
+        let _ = cr.show_text(key);
+        cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
+        cr.move_to(x + pad + key_w + col_gap, ty + row_h);
+        let _ = cr.show_text(action);
+        ty += row_h + row_gap;
+    }
+}
+
 fn draw(cr: &Context, w: i32, h: i32, st: &State) -> Option<Rect> {
     // The screenshot itself is painted by a GdkTexture-backed Picture widget
     // underneath this transparent DrawingArea (composited by GSK, effectively
@@ -1295,6 +1381,12 @@ fn draw(cr: &Context, w: i32, h: i32, st: &State) -> Option<Rect> {
         draw_label(cr, 16.0, h as f64 - 64.0, msg, &st.theme);
     }
 
+    if !st.legend_available {
+        if let Some(entries) = legend_entries(st) {
+            draw_builtin_legend(cr, &st.theme, w, entries);
+        }
+    }
+
     hover_box
 }
 
@@ -1357,6 +1449,7 @@ fn build_ui(app: &Application) {
         snap_enabled: true,
         tolerance_level: DEFAULT_TOLERANCE_LEVEL,
         show_legend: true,
+        legend_available: command_exists("omarchy-legend"),
         shift_held: false,
         measure_lines_h: Vec::new(),
         measure_lines_v: Vec::new(),
@@ -1781,15 +1874,26 @@ fn build_ui(app: &Application) {
     // doesn't linger after this process is gone — omarchy-legend has no
     // auto-hide timer (unlike omarchy-osd) since it's meant to persist
     // alongside the calling app, so it's this app's job to clean it up.
-    window.connect_close_request(|_| {
-        hide_legend_card();
-        glib::Propagation::Proceed
-    });
+    // Nothing to do here when the built-in fallback is in play: that's
+    // drawn straight from state and disappears the instant this window
+    // does, no separate hide call needed.
+    {
+        let state = state.clone();
+        window.connect_close_request(move |_| {
+            if state.borrow().legend_available {
+                hide_legend_card();
+            }
+            glib::Propagation::Proceed
+        });
+    }
 
     window.set_child(Some(&overlay));
     window.present();
-    if state.borrow().show_legend {
-        show_legend_idle();
+    let st = state.borrow();
+    if st.legend_available {
+        if let Some(entries) = legend_entries(&st) {
+            show_legend_entries(entries);
+        }
     }
 }
 
