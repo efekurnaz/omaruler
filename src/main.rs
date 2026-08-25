@@ -153,15 +153,64 @@ fn active_monitor() -> Option<MonitorInfo> {
     Some(MonitorInfo { name, scale })
 }
 
-fn capture_monitor(name: &str) -> Option<RgbaImage> {
-    let tmp = std::env::temp_dir().join(format!("{}-{}.png", APP_NAME, std::process::id()));
-    let status = Command::new("grim").args(["-o", name]).arg(&tmp).status().ok()?;
-    if !status.success() {
+/// Parses a binary PPM (P6) buffer straight into an RGBA image, expanding
+/// RGB to RGBA (a screenshot is always fully opaque). This is what actually
+/// fixes slow startup: capturing as PNG and decoding it back through the
+/// generic `image` crate meant paying for a full compress-then-decompress
+/// round trip on a whole-screen image for no reason — PPM is uncompressed,
+/// so both sides of that trip are just a memory copy.
+fn decode_ppm(bytes: &[u8]) -> Option<RgbaImage> {
+    if !bytes.starts_with(b"P6") {
         return None;
     }
-    let img = image::open(&tmp).ok()?.to_rgba8();
-    let _ = std::fs::remove_file(&tmp);
-    Some(img)
+    let mut pos = 2;
+    let mut fields = [0u32; 3];
+    for field in fields.iter_mut() {
+        loop {
+            while bytes.get(pos).is_some_and(|b| b.is_ascii_whitespace()) {
+                pos += 1;
+            }
+            if bytes.get(pos) == Some(&b'#') {
+                while bytes.get(pos).is_some_and(|&b| b != b'\n') {
+                    pos += 1;
+                }
+                continue;
+            }
+            break;
+        }
+        let start = pos;
+        while bytes.get(pos).is_some_and(|b| !b.is_ascii_whitespace()) {
+            pos += 1;
+        }
+        *field = std::str::from_utf8(bytes.get(start..pos)?).ok()?.parse().ok()?;
+    }
+    pos += 1; // exactly one whitespace byte separates the header from pixel data
+    let (w, h, maxval) = (fields[0], fields[1], fields[2]);
+    if maxval != 255 || w == 0 || h == 0 {
+        return None;
+    }
+    let pixel_count = w as usize * h as usize;
+    let rgb = bytes.get(pos..pos + pixel_count * 3)?;
+    let mut rgba = vec![0u8; pixel_count * 4];
+    for i in 0..pixel_count {
+        rgba[i * 4] = rgb[i * 3];
+        rgba[i * 4 + 1] = rgb[i * 3 + 1];
+        rgba[i * 4 + 2] = rgb[i * 3 + 2];
+        rgba[i * 4 + 3] = 255;
+    }
+    RgbaImage::from_raw(w, h, rgba)
+}
+
+/// Captures straight to stdout (grim's `-` output-file) rather than a temp
+/// file, and as uncompressed PPM rather than PNG — no disk round trip and
+/// no compression, since this is a full-screen capture done fresh on every
+/// launch and startup latency is directly user-visible.
+fn capture_monitor(name: &str) -> Option<RgbaImage> {
+    let output = Command::new("grim").args(["-t", "ppm", "-o", name, "-"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    decode_ppm(&output.stdout)
 }
 
 fn parse_hex_color(s: &str) -> Option<(f64, f64, f64)> {
@@ -192,16 +241,22 @@ fn command_exists(name: &str) -> bool {
     })
 }
 
-/// Resolves one semantic color from the active Omarchy theme via
+/// Starts resolving one semantic color from the active Omarchy theme via
 /// `omarchy-theme-color`, which handles the alias/fallback cascade that
 /// every other theme consumer (templates, tmux, GNOME, ...) shares — so
 /// this app follows the same palette as the rest of the desktop instead of
-/// hand-parsing colors.toml itself.
-fn theme_color_rgb(key: &str, fallback: (f64, f64, f64)) -> (f64, f64, f64) {
-    Command::new("omarchy-theme-color")
-        .arg(key)
-        .output()
-        .ok()
+/// hand-parsing colors.toml itself. Returns the still-running child;
+/// `fetch_theme` spawns all of these before waiting on any of them; each
+/// `omarchy-theme-color` invocation is its own process (fork/exec plus
+/// theme file I/O), so waiting on them one at a time serialized costs that
+/// pay five times over for no reason.
+fn theme_color_spawn(key: &str) -> Option<std::process::Child> {
+    Command::new("omarchy-theme-color").arg(key).stdout(Stdio::piped()).spawn().ok()
+}
+
+fn theme_color_collect(child: Option<std::process::Child>, fallback: (f64, f64, f64)) -> (f64, f64, f64) {
+    child
+        .and_then(|c| c.wait_with_output().ok())
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| parse_hex_color(&s))
@@ -209,12 +264,17 @@ fn theme_color_rgb(key: &str, fallback: (f64, f64, f64)) -> (f64, f64, f64) {
 }
 
 fn fetch_theme() -> Theme {
+    let accent = theme_color_spawn("accent");
+    let foreground = theme_color_spawn("foreground");
+    let background = theme_color_spawn("background");
+    let guide = theme_color_spawn("magenta");
+    let measure = theme_color_spawn("cyan");
     Theme {
-        accent: theme_color_rgb("accent", (1.0, 0.85, 0.2)),
-        foreground: theme_color_rgb("foreground", (1.0, 1.0, 1.0)),
-        background: theme_color_rgb("background", (0.0, 0.0, 0.0)),
-        guide: theme_color_rgb("magenta", (1.0, 0.2, 0.6)),
-        measure: theme_color_rgb("cyan", (0.2, 0.85, 0.9)),
+        accent: theme_color_collect(accent, (1.0, 0.85, 0.2)),
+        foreground: theme_color_collect(foreground, (1.0, 1.0, 1.0)),
+        background: theme_color_collect(background, (0.0, 0.0, 0.0)),
+        guide: theme_color_collect(guide, (1.0, 0.2, 0.6)),
+        measure: theme_color_collect(measure, (0.2, 0.85, 0.9)),
     }
 }
 
@@ -321,6 +381,19 @@ fn refresh_legend(st: &State) {
     }
 }
 
+#[inline]
+fn clamped_idx(x: i32, y: i32, w: i32, h: i32) -> usize {
+    let x = x.clamp(0, w - 1) as u32;
+    let y = y.clamp(0, h - 1) as u32;
+    (y * w as u32 + x) as usize
+}
+
+/// Sobel gradient magnitude over the whole screenshot, used to magnet-snap
+/// the cursor to nearby edges — the one substantial per-pixel computation
+/// done at startup. Split across all available CPU cores (each thread owns
+/// a disjoint row range of `grad`, reading the shared read-only `gray`
+/// buffer) rather than a single-threaded pass, since this runs fresh on
+/// every launch and startup latency is directly user-visible.
 fn compute_gradient(img: &RgbaImage) -> (Vec<f32>, u32, u32) {
     let (w, h) = img.dimensions();
     let gray: Vec<f32> = (0..h)
@@ -332,27 +405,34 @@ fn compute_gradient(img: &RgbaImage) -> (Vec<f32>, u32, u32) {
         })
         .collect();
 
-    let idx = |x: i32, y: i32| -> usize {
-        let x = x.clamp(0, w as i32 - 1) as u32;
-        let y = y.clamp(0, h as i32 - 1) as u32;
-        (y * w + x) as usize
-    };
-
+    let (wi, hi) = (w as i32, h as i32);
     let mut grad = vec![0f32; (w * h) as usize];
-    for y in 0..h as i32 {
-        for x in 0..w as i32 {
-            let gx = -gray[idx(x - 1, y - 1)] + gray[idx(x + 1, y - 1)]
-                - 2.0 * gray[idx(x - 1, y)]
-                + 2.0 * gray[idx(x + 1, y)]
-                - gray[idx(x - 1, y + 1)]
-                + gray[idx(x + 1, y + 1)];
-            let gy = -gray[idx(x - 1, y - 1)] - 2.0 * gray[idx(x, y - 1)] - gray[idx(x + 1, y - 1)]
-                + gray[idx(x - 1, y + 1)]
-                + 2.0 * gray[idx(x, y + 1)]
-                + gray[idx(x + 1, y + 1)];
-            grad[(y as u32 * w + x as u32) as usize] = (gx * gx + gy * gy).sqrt();
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(h.max(1) as usize).max(1);
+    let rows_per_chunk = (h as usize).div_ceil(threads);
+
+    std::thread::scope(|scope| {
+        for (i, chunk) in grad.chunks_mut(rows_per_chunk * w as usize).enumerate() {
+            let y0 = (i * rows_per_chunk) as i32;
+            let gray = &gray;
+            scope.spawn(move || {
+                for (row, out_row) in chunk.chunks_mut(w as usize).enumerate() {
+                    let y = y0 + row as i32;
+                    for x in 0..wi {
+                        let gx = -gray[clamped_idx(x - 1, y - 1, wi, hi)] + gray[clamped_idx(x + 1, y - 1, wi, hi)]
+                            - 2.0 * gray[clamped_idx(x - 1, y, wi, hi)]
+                            + 2.0 * gray[clamped_idx(x + 1, y, wi, hi)]
+                            - gray[clamped_idx(x - 1, y + 1, wi, hi)]
+                            + gray[clamped_idx(x + 1, y + 1, wi, hi)];
+                        let gy = -gray[clamped_idx(x - 1, y - 1, wi, hi)] - 2.0 * gray[clamped_idx(x, y - 1, wi, hi)] - gray[clamped_idx(x + 1, y - 1, wi, hi)]
+                            + gray[clamped_idx(x - 1, y + 1, wi, hi)]
+                            + 2.0 * gray[clamped_idx(x, y + 1, wi, hi)]
+                            + gray[clamped_idx(x + 1, y + 1, wi, hi)];
+                        out_row[x as usize] = (gx * gx + gy * gy).sqrt();
+                    }
+                }
+            });
         }
-    }
+    });
     (grad, w, h)
 }
 
@@ -1415,6 +1495,20 @@ fn build_ui(app: &Application) {
         .decorated(false)
         .title(DISPLAY_NAME)
         .build();
+
+    // GTK4's default theme applies an implicit opacity transition to
+    // top-level windows on map, which reads as a brief fade-in — on top of
+    // the Hyprland layer_rule (bindings.lua) that already disables the
+    // compositor's own open/close animation for this namespace. This is a
+    // one-shot overlay meant to appear the instant the keybind is pressed,
+    // so both layers of animation are killed.
+    let css = gtk4::CssProvider::new();
+    css.load_from_data("window { transition: none; }");
+    gtk4::style_context_add_provider_for_display(
+        &gtk4::prelude::WidgetExt::display(&window),
+        &css,
+        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
 
     window.set_cursor_from_name(Some("none"));
 

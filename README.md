@@ -8,15 +8,27 @@ save that selection as an image, or pick a color.
 ## How it works
 
 - Reads the active output and cursor position via `hyprctl`.
-- Grabs a screenshot of that output with `grim`, decoded once into an RGBA
-  buffer.
+- Grabs a screenshot of that output with `grim`, captured as uncompressed
+  PPM straight to stdout (`grim -t ppm -o <output> -`, parsed by a small
+  built-in decoder) rather than PNG to a temp file — PNG's compress/decode
+  round trip on a full-screen image was most of this app's launch latency
+  for no benefit, since the screenshot is immediately decoded back into raw
+  pixels anyway.
 - Runs a one-time Sobel edge-detection pass over it, used to magnet-snap the
-  cursor to nearby edges.
+  cursor to nearby edges — split across all available CPU cores, since it's
+  the one substantial per-pixel computation this app does and it happens
+  fresh on every launch.
+- Fetches the theme colors (`omarchy-theme-color`) with all 5 lookups
+  spawned before waiting on any of them, rather than one at a time.
 - Opens a `wlr-layer-shell` overlay (via `gtk4-layer-shell`) pinned to that
   output. The screenshot is handed to GTK as a `GdkTexture` and drawn by a
   `Picture` widget — composited by the scene graph for free every frame — with
   a transparent `DrawingArea` on top for the thin lines/text, which is what
-  keeps the redraw cheap regardless of screen resolution.
+  keeps the redraw cheap regardless of screen resolution. A small CSS
+  override (`window { transition: none; }`) kills GTK's default window-open
+  fade, on top of the `no_anim` Hyprland layer_rule in `bindings.lua` — this
+  is a one-shot overlay meant to appear the instant the keybind is pressed,
+  not ease in.
 - The pointer position is polled once per compositor frame (via
   `gdk::Surface::device_position`, from a frame-clock tick callback) rather
   than reacted to as motion events, and the system cursor is hidden while the
