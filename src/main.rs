@@ -74,6 +74,167 @@ type HLine = (f64, f64, f64);
 /// A pinned vertical measure line: (x, top, bottom), all logical.
 type VLine = (f64, f64, f64);
 
+/// A tiny xorshift64 PRNG so the duck easter egg's flight path doesn't need
+/// to pull in the `rand` crate for the one place this app wants randomness.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Rng(seed | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn range(&mut self, lo: f64, hi: f64) -> f64 {
+        let unit = (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+        lo + unit * (hi - lo)
+    }
+}
+
+/// Easter egg: press `d` to spawn one, click it to kill it. Flies with an
+/// erratic Duck Hunt-style path (constant speed, occasional random turns,
+/// bounces off screen edges) and flies off on its own if you're too slow.
+struct Duck {
+    pos: (f64, f64),
+    vel: (f64, f64),
+    rng: Rng,
+    spawned: std::time::Instant,
+    last_update: std::time::Instant,
+    next_turn: std::time::Instant,
+}
+
+const DUCK_HIT_RADIUS: f64 = 22.0;
+/// Forgiving "kill zone" around the cursor, like a brush-tool radius — the
+/// duck doesn't have to be exactly under the pointer, just overlapping this
+/// circle, closer to aiming a rifle than requiring a pixel-perfect click.
+const CURSOR_AIM_RADIUS: f64 = 26.0;
+const DUCK_LIFETIME: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn spawn_duck(screen_w: f64, screen_h: f64) -> Duck {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x2545_F491_4F6C_DD1D);
+    let mut rng = Rng::new(seed);
+    let speed = rng.range(140.0, 220.0);
+    let angle = rng.range(0.0, std::f64::consts::TAU);
+    let now = std::time::Instant::now();
+    Duck {
+        pos: (rng.range(screen_w * 0.2, screen_w * 0.8), rng.range(screen_h * 0.3, screen_h * 0.8)),
+        vel: (speed * angle.cos(), speed * angle.sin()),
+        rng,
+        spawned: now,
+        last_update: now,
+        next_turn: now + std::time::Duration::from_millis(600),
+    }
+}
+
+/// Advances flight physics by real elapsed time (clamped so a stalled frame
+/// clock can't fling the duck across the screen in one jump), bounces it
+/// off the screen edges, and occasionally injects a random turn — the
+/// erratic part of the flight path.
+fn update_duck(duck: &mut Duck, screen_w: f64, screen_h: f64) {
+    let now = std::time::Instant::now();
+    let dt = now.duration_since(duck.last_update).as_secs_f64().min(0.05);
+    duck.last_update = now;
+
+    duck.pos.0 += duck.vel.0 * dt;
+    duck.pos.1 += duck.vel.1 * dt;
+
+    let margin = DUCK_HIT_RADIUS;
+    if duck.pos.0 < margin {
+        duck.pos.0 = margin;
+        duck.vel.0 = duck.vel.0.abs();
+    } else if duck.pos.0 > screen_w - margin {
+        duck.pos.0 = screen_w - margin;
+        duck.vel.0 = -duck.vel.0.abs();
+    }
+    if duck.pos.1 < margin {
+        duck.pos.1 = margin;
+        duck.vel.1 = duck.vel.1.abs();
+    } else if duck.pos.1 > screen_h - margin {
+        duck.pos.1 = screen_h - margin;
+        duck.vel.1 = -duck.vel.1.abs();
+    }
+
+    if now >= duck.next_turn {
+        let speed = (duck.vel.0 * duck.vel.0 + duck.vel.1 * duck.vel.1).sqrt();
+        let angle = duck.vel.1.atan2(duck.vel.0) + duck.rng.range(-1.2, 1.2);
+        duck.vel = (speed * angle.cos(), speed * angle.sin());
+        duck.next_turn = now + std::time::Duration::from_millis(duck.rng.range(500.0, 1400.0) as u64);
+    }
+}
+
+fn duck_hit(duck: &Duck, point: (f64, f64)) -> bool {
+    let dx = point.0 - duck.pos.0;
+    let dy = point.1 - duck.pos.1;
+    (dx * dx + dy * dy).sqrt() <= DUCK_HIT_RADIUS + CURSOR_AIM_RADIUS
+}
+
+/// A stylized duck silhouette (no image asset needed) — body, head, beak,
+/// eye, and a wing that flaps on a simple sine cycle. Mirrored horizontally
+/// to face whichever way it's currently flying.
+fn draw_duck(cr: &Context, duck: &Duck) {
+    let (x, y) = duck.pos;
+    let facing_right = duck.vel.0 >= 0.0;
+    let flap = (duck.spawned.elapsed().as_secs_f64() * 9.0).sin();
+
+    let _ = cr.save();
+    cr.translate(x, y);
+    if !facing_right {
+        cr.scale(-1.0, 1.0);
+    }
+
+    cr.set_source_rgb(0.95, 0.78, 0.2);
+    let _ = cr.save();
+    cr.scale(1.0, 0.7);
+    cr.arc(0.0, 0.0, 16.0, 0.0, std::f64::consts::TAU);
+    let _ = cr.fill();
+    let _ = cr.restore();
+
+    cr.arc(12.0, -10.0, 8.0, 0.0, std::f64::consts::TAU);
+    let _ = cr.fill();
+
+    cr.set_source_rgb(0.8, 0.63, 0.1);
+    let wing_y = flap * 6.0;
+    cr.move_to(-6.0, -2.0);
+    cr.line_to(-16.0, -10.0 + wing_y);
+    cr.line_to(-2.0, 3.0 + wing_y * 0.3);
+    cr.close_path();
+    let _ = cr.fill();
+
+    cr.set_source_rgb(0.9, 0.5, 0.1);
+    cr.move_to(19.0, -10.0);
+    cr.line_to(29.0, -8.0);
+    cr.line_to(19.0, -6.0);
+    cr.close_path();
+    let _ = cr.fill();
+
+    cr.set_source_rgb(0.05, 0.05, 0.05);
+    cr.arc(14.0, -12.0, 1.4, 0.0, std::f64::consts::TAU);
+    let _ = cr.fill();
+
+    let _ = cr.restore();
+}
+
+/// A faint reticle around the cursor while a duck is up, sized to
+/// `CURSOR_AIM_RADIUS` so the forgiving "nearby counts" kill zone is
+/// visible rather than a hidden rule.
+fn draw_aim_circle(cr: &Context, theme: &Theme, cx: f64, cy: f64) {
+    let ac = theme.guide;
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.5);
+    cr.set_line_width(1.0);
+    cr.arc(cx, cy, CURSOR_AIM_RADIUS, 0.0, std::f64::consts::TAU);
+    let _ = cr.stroke();
+}
+
 struct State {
     img: RgbaImage,
     grad: Vec<f32>,
@@ -113,6 +274,8 @@ struct State {
     /// one specific collection.
     undo_stack: Vec<UndoItem>,
     last_message: Option<String>,
+    /// Easter egg (`d`) — see `Duck`/`spawn_duck`/`update_duck`/`draw_duck`.
+    duck: Option<Duck>,
 }
 
 fn rgba_at(img: &RgbaImage, x: u32, y: u32) -> (u8, u8, u8, u8) {
@@ -1457,6 +1620,11 @@ fn draw(cr: &Context, w: i32, h: i32, st: &State) -> Option<Rect> {
         }
     }
 
+    if let Some(duck) = &st.duck {
+        draw_duck(cr, duck);
+        draw_aim_circle(cr, &st.theme, cx, cy);
+    }
+
     if let Some(msg) = &st.last_message {
         draw_label(cr, 16.0, h as f64 - 64.0, msg, &st.theme);
     }
@@ -1551,6 +1719,7 @@ fn build_ui(app: &Application) {
         guides_v: Vec::new(),
         undo_stack: Vec::new(),
         last_message: None,
+        duck: None,
     }));
 
     let picture = Picture::for_paintable(&texture);
@@ -1619,6 +1788,29 @@ fn build_ui(app: &Application) {
                     }
                 }
             }
+
+            // Easter egg: the duck flies continuously (not just in
+            // response to cursor motion), so it needs its own unconditional
+            // per-frame update independent of the pointer-driven redraw
+            // logic above.
+            {
+                let mut st = state.borrow_mut();
+                let expired = st.duck.as_ref().is_some_and(|d| d.spawned.elapsed() >= DUCK_LIFETIME);
+                if expired {
+                    st.duck = None;
+                    drop(st);
+                    flash_status("The duck got away!");
+                    area.queue_draw();
+                } else if st.duck.is_some() {
+                    let screen_w = st.img.width() as f64 / st.scale;
+                    let screen_h = st.img.height() as f64 / st.scale;
+                    if let Some(duck) = st.duck.as_mut() {
+                        update_duck(duck, screen_w, screen_h);
+                    }
+                    drop(st);
+                    area.queue_draw();
+                }
+            }
             glib::ControlFlow::Continue
         });
     }
@@ -1631,6 +1823,13 @@ fn build_ui(app: &Application) {
         let window = window.clone();
         click.connect_pressed(move |_g, _n, _x, _y| {
             let mut st = state.borrow_mut();
+            if st.duck.as_ref().is_some_and(|d| duck_hit(d, st.cursor)) {
+                st.duck = None;
+                drop(st);
+                flash_status("🦆 Quack!");
+                area.queue_draw();
+                return;
+            }
             match st.mode {
                 Mode::Ruler => {
                     let hovering_open = !st.snapped_rects.is_empty()
@@ -1731,13 +1930,14 @@ fn build_ui(app: &Application) {
                         area.queue_draw();
                         return glib::Propagation::Stop;
                     }
-                    let has_anything = st.mode == Mode::Ruler
-                        && (st.dragging
-                            || !st.snapped_rects.is_empty()
-                            || !st.guides_h.is_empty()
-                            || !st.guides_v.is_empty()
-                            || !st.measure_lines_h.is_empty()
-                            || !st.measure_lines_v.is_empty());
+                    let has_anything = st.duck.is_some()
+                        || (st.mode == Mode::Ruler
+                            && (st.dragging
+                                || !st.snapped_rects.is_empty()
+                                || !st.guides_h.is_empty()
+                                || !st.guides_v.is_empty()
+                                || !st.measure_lines_h.is_empty()
+                                || !st.measure_lines_v.is_empty()));
                     if has_anything {
                         st.dragging = false;
                         st.start = None;
@@ -1747,6 +1947,7 @@ fn build_ui(app: &Application) {
                         st.measure_lines_h.clear();
                         st.measure_lines_v.clear();
                         st.undo_stack.clear();
+                        st.duck = None;
                         sync_cursor_visibility(&window, &st);
                         refresh_legend(&st);
                         drop(st);
@@ -1802,6 +2003,7 @@ fn build_ui(app: &Application) {
                     st.measure_lines_h.clear();
                     st.measure_lines_v.clear();
                     st.undo_stack.clear();
+                    st.duck = None;
                     sync_cursor_visibility(&window, &st);
                     refresh_legend(&st);
                     drop(st);
@@ -1859,6 +2061,20 @@ fn build_ui(app: &Application) {
                     let mut st = state.borrow_mut();
                     st.show_legend = !st.show_legend;
                     refresh_legend(&st);
+                    drop(st);
+                    area.queue_draw();
+                    glib::Propagation::Stop
+                }
+                // Easter egg — deliberately not in the legend.
+                gdk::Key::d | gdk::Key::D => {
+                    let mut st = state.borrow_mut();
+                    if st.duck.is_some() {
+                        st.duck = None;
+                    } else {
+                        let screen_w = st.img.width() as f64 / st.scale;
+                        let screen_h = st.img.height() as f64 / st.scale;
+                        st.duck = Some(spawn_duck(screen_w, screen_h));
+                    }
                     drop(st);
                     area.queue_draw();
                     glib::Propagation::Stop
