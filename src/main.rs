@@ -460,6 +460,12 @@ fn save_selection(st: &State, rect: Rect) {
     if cropped.save(&path).is_ok() {
         copy_to_clipboard(&path);
         notify(APP_NAME, &format!("Saved {}x{} to {}", w, h, path));
+        // omasnap (github.com/tobi/omasnap, already used elsewhere on this
+        // machine for screenshots) accepts an existing image path via
+        // `--file` and opens it straight into its annotation editor instead
+        // of capturing the screen — hand the crop off to it so it can be
+        // marked up right away.
+        let _ = Command::new("omasnap").arg("--file").arg(&path).spawn();
     } else {
         notify(APP_NAME, "Failed to save image");
     }
@@ -590,7 +596,7 @@ fn draw_tolerance_badge(cr: &Context, theme: &Theme, screen_w: f64, tolerance_le
 /// long line, adapted from omasnap's `drawHotkeyLegend` (same idea: a small
 /// floating card, key column dimmer than the action it does) but pulling
 /// colors from the active Omarchy theme instead of a hardcoded palette.
-fn draw_legend(cr: &Context, theme: &Theme, screen_w: f64) {
+fn draw_legend(cr: &Context, theme: &Theme, screen_w: f64, cursor: (f64, f64)) {
     const ENTRIES: [(&str, &str); 4] =
         [("drag", "select & snap"), ("r", "reset"), ("c", "color"), ("l", "hide legend")];
     select_font(cr);
@@ -604,8 +610,19 @@ fn draw_legend(cr: &Context, theme: &Theme, screen_w: f64) {
     let val_w = ENTRIES.iter().map(|(_, v)| measure_text(cr, v).0).fold(0.0_f64, f64::max);
     let card_w = pad * 2.0 + key_w + key_gap + val_w;
     let card_h = pad * 2.0 + ENTRIES.len() as f64 * row_h;
-    let x = screen_w - card_w - 14.0;
     let y = 14.0;
+
+    // Sits top-right by default, but hovering it (with a little slack, so it
+    // doesn't flip right at the pixel edge) snaps it to top-left instead —
+    // same idea as omasnap's card flip, just triggered by direct hover
+    // rather than predicting where a drag might go.
+    let right_x = screen_w - card_w - 14.0;
+    let margin = 24.0;
+    let over_right = cursor.0 >= right_x - margin
+        && cursor.0 <= right_x + card_w + margin
+        && cursor.1 >= y - margin
+        && cursor.1 <= y + card_h + margin;
+    let x = if over_right { 14.0 } else { right_x };
 
     cr.set_source_rgba(bg.0, bg.1, bg.2, 0.9);
     cr.rectangle(x, y, card_w, card_h);
@@ -855,7 +872,7 @@ fn draw(cr: &Context, w: i32, h: i32, st: &State) -> Option<Rect> {
 
             draw_tolerance_badge(cr, &st.theme, w as f64, st.tolerance_level);
             if st.show_legend {
-                draw_legend(cr, &st.theme, w as f64);
+                draw_legend(cr, &st.theme, w as f64, (cx, cy));
             }
         }
         Mode::Color => {
