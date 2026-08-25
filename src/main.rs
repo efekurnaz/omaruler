@@ -16,7 +16,7 @@ use image::RgbaImage;
 const APP_NAME: &str = "omeasure";
 const APP_ID: &str = "sh.omarchy.omeasure";
 const TOLERANCE_LEVELS: [(u8, &str); 4] = [(0, "Off"), (10, "Low"), (24, "Med"), (48, "High")];
-const DEFAULT_TOLERANCE_LEVEL: usize = 1;
+const DEFAULT_TOLERANCE_LEVEL: usize = 3;
 const MAX_EXTENT_SCAN: i64 = 2000;
 const RATIO_MAX: u32 = 21;
 const RATIO_HIDE_ERROR: f64 = 0.05;
@@ -469,6 +469,19 @@ fn point_in_rect(p: (f64, f64), r: Rect) -> bool {
     p.0 >= r.0 && p.0 <= r.2 && p.1 >= r.1 && p.1 <= r.3
 }
 
+/// The system cursor is rendered by the compositor via a low-latency
+/// hardware-cursor path, completely separate from our own client-side
+/// redraw — leaving it visible during precision work (hovering or
+/// dragging) means there are always two pointers on screen, and ours will
+/// always look laggy by comparison. Hide it while measuring; once a
+/// rectangle has snapped there's no more precision tracking to do, and a
+/// visible cursor makes it much easier to land a click on the small
+/// hover-to-save box.
+fn sync_cursor_visibility(window: &ApplicationWindow, st: &State) {
+    let visible = st.mode == Mode::Ruler && st.snapped_rect.is_some();
+    window.set_cursor_from_name(Some(if visible { "default" } else { "none" }));
+}
+
 fn find_gdk_monitor(window: &ApplicationWindow, name: &str) -> Option<gdk::Monitor> {
     let display = gtk4::prelude::WidgetExt::display(window);
     let monitors = display.monitors();
@@ -530,11 +543,11 @@ fn draw_label(cr: &Context, x: f64, y: f64, text: &str, theme: &Theme) {
     draw_label_box(cr, x, y, tw, th, text, theme);
 }
 
-/// The bottom hint bar. Shows the tolerance cycle as `off / low / med /
-/// high` with the active level highlighted (rather than just naming the
-/// current value), so the whole range and where you are in it is visible
-/// at a glance — plus the remaining controls, kept short since Escape and
-/// window-close conventions don't need spelling out.
+/// The bottom hint bar. Shows the tolerance cycle as `off low med high`
+/// with the active level picked out in the theme accent color (rather than
+/// just naming the current value), so the whole range and where you are in
+/// it is visible at a glance — plus the remaining controls, kept short
+/// since Escape and window-close conventions don't need spelling out.
 fn draw_legend(cr: &Context, x: f64, y: f64, theme: &Theme, tolerance_level: usize) {
     let pad = 6.0;
     select_font(cr);
@@ -543,7 +556,7 @@ fn draw_legend(cr: &Context, x: f64, y: f64, theme: &Theme, tolerance_level: usi
     let mut segments: Vec<(String, bool)> = vec![("tolerance(t): ".to_string(), false)];
     for (i, (_, name)) in TOLERANCE_LEVELS.iter().enumerate() {
         if i > 0 {
-            segments.push((" / ".to_string(), false));
+            segments.push(("  ".to_string(), false));
         }
         segments.push((name.to_lowercase(), i == tolerance_level));
     }
@@ -567,10 +580,7 @@ fn draw_legend(cr: &Context, x: f64, y: f64, theme: &Theme, tolerance_level: usi
     let text_y = y + pad + line_h;
     for ((text, highlighted), w) in segments.iter().zip(widths.iter()) {
         if *highlighted {
-            cr.set_source_rgba(ac.0, ac.1, ac.2, 0.9);
-            cr.rectangle(run_x - 2.0, y + 3.0, w + 4.0, box_h - 6.0);
-            let _ = cr.fill();
-            cr.set_source_rgba(bg.0, bg.1, bg.2, 1.0);
+            cr.set_source_rgba(ac.0, ac.1, ac.2, 1.0);
         } else {
             cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
         }
@@ -859,14 +869,6 @@ fn build_ui(app: &Application) {
         .title(APP_NAME)
         .build();
 
-    // The system cursor is rendered by the compositor via a low-latency
-    // hardware-cursor path, completely separate from our own client-side
-    // redraw. Leaving it visible means there are always two pointers on
-    // screen — the real one and ours — and ours will always look laggy by
-    // comparison no matter how fast we redraw, because it's going through
-    // a fundamentally slower path (client damage -> compositor repaint).
-    // Hiding it makes our drawn indicator the only pointer, which is what
-    // actually removes the perceived lag.
     window.set_cursor_from_name(Some("none"));
 
     window.init_layer_shell();
@@ -969,6 +971,7 @@ fn build_ui(app: &Application) {
     {
         let state = state.clone();
         let area = area.clone();
+        let window = window.clone();
         click.connect_pressed(move |_g, _n, _x, _y| {
             let mut st = state.borrow_mut();
             match st.mode {
@@ -994,6 +997,7 @@ fn build_ui(app: &Application) {
                     }
                 }
             }
+            sync_cursor_visibility(&window, &st);
             drop(st);
             area.queue_draw();
         });
@@ -1001,6 +1005,7 @@ fn build_ui(app: &Application) {
     {
         let state = state.clone();
         let area = area.clone();
+        let window = window.clone();
         click.connect_released(move |_g, _n, _x, _y| {
             let mut st = state.borrow_mut();
             if st.mode == Mode::Ruler && st.dragging {
@@ -1026,6 +1031,7 @@ fn build_ui(app: &Application) {
                 }
                 st.start = None;
             }
+            sync_cursor_visibility(&window, &st);
             drop(st);
             area.queue_draw();
         });
@@ -1045,6 +1051,7 @@ fn build_ui(app: &Application) {
                         st.dragging = false;
                         st.start = None;
                         st.snapped_rect = None;
+                        sync_cursor_visibility(&window, &st);
                         drop(st);
                         area.queue_draw();
                     } else {
@@ -1060,6 +1067,7 @@ fn build_ui(app: &Application) {
                     st.start = None;
                     st.snapped_rect = None;
                     st.last_message = None;
+                    sync_cursor_visibility(&window, &st);
                     drop(st);
                     area.queue_draw();
                     glib::Propagation::Stop
@@ -1076,6 +1084,7 @@ fn build_ui(app: &Application) {
                     st.start = None;
                     st.dragging = false;
                     st.snapped_rect = None;
+                    sync_cursor_visibility(&window, &st);
                     drop(st);
                     area.queue_draw();
                     glib::Propagation::Stop
@@ -1083,9 +1092,7 @@ fn build_ui(app: &Application) {
                 gdk::Key::t | gdk::Key::T => {
                     let mut st = state.borrow_mut();
                     st.tolerance_level = (st.tolerance_level + 1) % TOLERANCE_LEVELS.len();
-                    let name = TOLERANCE_LEVELS[st.tolerance_level].1;
                     drop(st);
-                    notify("Tolerance", name);
                     area.queue_draw();
                     glib::Propagation::Stop
                 }
