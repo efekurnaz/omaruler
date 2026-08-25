@@ -16,6 +16,9 @@ const APP_ID: &str = "sh.omarchy.pixel-snap";
 const TOLERANCE_LEVELS: [(u8, &str); 4] = [(0, "Off"), (10, "Low"), (24, "Med"), (48, "High")];
 const DEFAULT_TOLERANCE_LEVEL: usize = 1;
 const MAX_EXTENT_SCAN: i64 = 2000;
+const RATIO_MAX: u32 = 21;
+const RATIO_HIDE_ERROR: f64 = 0.05;
+const RATIO_EXACT_ERROR: f64 = 0.005;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Mode {
@@ -35,6 +38,9 @@ struct MonitorInfo {
     scale: f64,
 }
 
+/// A logical-space rectangle as (left, top, right, bottom).
+type Rect = (f64, f64, f64, f64);
+
 struct State {
     img: RgbaImage,
     grad: Vec<f32>,
@@ -46,6 +52,11 @@ struct State {
     mode: Mode,
     dragging: bool,
     start: Option<(f64, f64)>,
+    snapped_rect: Option<Rect>,
+    /// On-screen bounds of the size-readout box drawn for `snapped_rect`,
+    /// so a click can tell whether it landed on "save this" vs "start a new
+    /// drag". Recomputed every draw() call.
+    hover_box: Option<Rect>,
     snap_enabled: bool,
     tolerance_level: usize,
     show_legend: bool,
@@ -221,16 +232,7 @@ fn scan_extent(img: &RgbaImage, px: i64, py: i64, tol: u8) -> (i64, i64, i64, i6
         return (px, px, py, py);
     }
     let (rr, rg, rb, _) = rgba_at(img, px as u32, py as u32);
-    let tol = tol as i32;
-    let close = |x: i64, y: i64| -> bool {
-        if x < 0 || y < 0 || x >= w || y >= h {
-            return false;
-        }
-        let (r, g, b, _) = rgba_at(img, x as u32, y as u32);
-        (r as i32 - rr as i32).abs() <= tol
-            && (g as i32 - rg as i32).abs() <= tol
-            && (b as i32 - rb as i32).abs() <= tol
-    };
+    let close = |x: i64, y: i64| color_close(img, x, y, w, h, (rr, rg, rb), tol);
 
     let mut left = px;
     let mut steps = 0;
@@ -259,14 +261,116 @@ fn scan_extent(img: &RgbaImage, px: i64, py: i64, tol: u8) -> (i64, i64, i64, i6
     (left, right, top, bottom)
 }
 
+fn color_close(img: &RgbaImage, x: i64, y: i64, w: i64, h: i64, reference: (u8, u8, u8), tol: u8) -> bool {
+    if x < 0 || y < 0 || x >= w || y >= h {
+        return false;
+    }
+    let (r, g, b, _) = rgba_at(img, x as u32, y as u32);
+    let tol = tol as i32;
+    (r as i32 - reference.0 as i32).abs() <= tol
+        && (g as i32 - reference.1 as i32).abs() <= tol
+        && (b as i32 - reference.2 as i32).abs() <= tol
+}
+
 /// Same walk as `scan_extent`, in the drawing area's logical coordinate
 /// space (physical / monitor scale), which is what CSS/devtools-style
 /// measurements should be reported in.
-fn scan_extent_logical(st: &State, cx: f64, cy: f64) -> (f64, f64, f64, f64) {
+fn scan_extent_logical(st: &State, cx: f64, cy: f64) -> Rect {
     let px = (cx * st.scale).round() as i64;
     let py = (cy * st.scale).round() as i64;
     let (l, r, t, b) = scan_extent(&st.img, px, py, TOLERANCE_LEVELS[st.tolerance_level].0);
-    (l as f64 / st.scale, r as f64 / st.scale, t as f64 / st.scale, b as f64 / st.scale)
+    (l as f64 / st.scale, t as f64 / st.scale, r as f64 / st.scale, b as f64 / st.scale)
+}
+
+/// The "snap to content" step for a dragged selection: each of the 4 edges
+/// independently shrinks inward from where the drag ended, using the color
+/// it started on (sampled at drag-release time) as its own reference, and
+/// stops the instant it hits a pixel that no longer matches — e.g. drag a
+/// loose box around a circle on white paper, and each edge eats through the
+/// white until it meets the circle. Every edge is capped at the rectangle's
+/// own center so opposing edges can't cross.
+fn shrink_rect(img: &RgbaImage, rect: (i64, i64, i64, i64), tol: u8) -> (i64, i64, i64, i64) {
+    let w = img.width() as i64;
+    let h = img.height() as i64;
+    let (mut l, mut t, mut r, mut b) = rect;
+    l = l.clamp(0, w - 1);
+    r = r.clamp(0, w - 1);
+    t = t.clamp(0, h - 1);
+    b = b.clamp(0, h - 1);
+    if r <= l || b <= t {
+        return (l, t, r, b);
+    }
+
+    let mid_x = (l + r) / 2;
+    let mid_y = (t + b) / 2;
+
+    let left_ref = {
+        let (r, g, b, _) = rgba_at(img, l as u32, mid_y as u32);
+        (r, g, b)
+    };
+    let right_ref = {
+        let (r, g, b, _) = rgba_at(img, r as u32, mid_y as u32);
+        (r, g, b)
+    };
+    let top_ref = {
+        let (r, g, b, _) = rgba_at(img, mid_x as u32, t as u32);
+        (r, g, b)
+    };
+    let bottom_ref = {
+        let (r, g, b, _) = rgba_at(img, mid_x as u32, b as u32);
+        (r, g, b)
+    };
+
+    let mut nl = l;
+    let mut steps = 0;
+    while steps < MAX_EXTENT_SCAN && nl + 1 < mid_x && color_close(img, nl + 1, mid_y, w, h, left_ref, tol) {
+        nl += 1;
+        steps += 1;
+    }
+    let mut nr = r;
+    steps = 0;
+    while steps < MAX_EXTENT_SCAN && nr - 1 > mid_x && color_close(img, nr - 1, mid_y, w, h, right_ref, tol) {
+        nr -= 1;
+        steps += 1;
+    }
+    let mut nt = t;
+    steps = 0;
+    while steps < MAX_EXTENT_SCAN && nt + 1 < mid_y && color_close(img, mid_x, nt + 1, w, h, top_ref, tol) {
+        nt += 1;
+        steps += 1;
+    }
+    let mut nb = b;
+    steps = 0;
+    while steps < MAX_EXTENT_SCAN && nb - 1 > mid_y && color_close(img, mid_x, nb - 1, w, h, bottom_ref, tol) {
+        nb -= 1;
+        steps += 1;
+    }
+    (nl, nt, nr, nb)
+}
+
+/// Best small-integer aspect ratio approximation with both terms in
+/// 1..=RATIO_MAX, e.g. 1366x768 -> ~16:9. Returns None when nothing in that
+/// range comes within RATIO_HIDE_ERROR relative error, so we don't show
+/// nonsense like 2345:123.
+fn best_ratio(w: f64, h: f64) -> Option<(u32, u32, bool)> {
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let target = w / h;
+    let mut best: Option<(u32, u32, f64)> = None;
+    for a in 1..=RATIO_MAX {
+        for b in 1..=RATIO_MAX {
+            let err = (a as f64 / b as f64 - target).abs() / target;
+            if best.map_or(true, |(_, _, be)| err < be) {
+                best = Some((a, b, err));
+            }
+        }
+    }
+    let (a, b, err) = best?;
+    if err > RATIO_HIDE_ERROR {
+        return None;
+    }
+    Some((a, b, err <= RATIO_EXACT_ERROR))
 }
 
 fn pixel_hex(img: &RgbaImage, x: u32, y: u32) -> Option<String> {
@@ -286,6 +390,53 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
+/// Crops the captured screenshot to `rect` (logical coords) and saves it
+/// under ~/Pictures/Screenshots, matching Omarchy's own screenshot naming
+/// convention.
+fn save_selection(st: &State, rect: Rect) {
+    let (l, t, r, b) = rect;
+    let iw = st.img.width();
+    let ih = st.img.height();
+    let pl = ((l * st.scale).round() as i64).clamp(0, iw as i64 - 1) as u32;
+    let pt = ((t * st.scale).round() as i64).clamp(0, ih as i64 - 1) as u32;
+    let pr = ((r * st.scale).round() as i64).clamp(0, iw as i64) as u32;
+    let pb = ((b * st.scale).round() as i64).clamp(0, ih as i64) as u32;
+    let w = pr.saturating_sub(pl).max(1);
+    let h = pb.saturating_sub(pt).max(1);
+
+    let cropped = image::imageops::crop_imm(&st.img, pl, pt, w, h).to_image();
+
+    let Ok(home) = std::env::var("HOME") else {
+        notify("Pixel ruler", "Could not resolve $HOME to save image");
+        return;
+    };
+    let dir = format!("{}/Pictures/Screenshots", home);
+    if std::fs::create_dir_all(&dir).is_err() {
+        notify("Pixel ruler", "Failed to create Pictures/Screenshots");
+        return;
+    }
+
+    let ts = Command::new("date")
+        .arg("+%Y-%m-%d_%H-%M-%S")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "output".to_string());
+
+    let path = format!("{}/pixel-snap-{}.png", dir, ts);
+    if cropped.save(&path).is_ok() {
+        copy_to_clipboard(&path);
+        notify("Pixel ruler", &format!("Saved {}x{} to {}", w, h, path));
+    } else {
+        notify("Pixel ruler", "Failed to save image");
+    }
+}
+
+fn point_in_rect(p: (f64, f64), r: Rect) -> bool {
+    p.0 >= r.0 && p.0 <= r.2 && p.1 >= r.1 && p.1 <= r.3
+}
+
 fn find_gdk_monitor(window: &ApplicationWindow, name: &str) -> Option<gdk::Monitor> {
     let display = gtk4::prelude::WidgetExt::display(window);
     let monitors = display.monitors();
@@ -299,21 +450,28 @@ fn find_gdk_monitor(window: &ApplicationWindow, name: &str) -> Option<gdk::Monit
     None
 }
 
-/// Draws a themed label box. `x, y` is the box's top-left corner (not a
-/// text baseline), so callers can anchor it directly to a screen position
-/// — e.g. offset down-right of the cursor — without reasoning about font
-/// metrics.
-fn draw_label(cr: &Context, x: f64, y: f64, text: &str, theme: &Theme) {
+fn select_font(cr: &Context) {
     let _ = cr.select_font_face(
         "monospace",
         gtk4::cairo::FontSlant::Normal,
         gtk4::cairo::FontWeight::Bold,
     );
     cr.set_font_size(13.0);
-    let (tw, th) = cr
-        .text_extents(text)
+}
+
+fn measure_text(cr: &Context, text: &str) -> (f64, f64) {
+    select_font(cr);
+    cr.text_extents(text)
         .map(|e| (e.width(), e.height()))
-        .unwrap_or((text.len() as f64 * 8.0, 12.0));
+        .unwrap_or((text.len() as f64 * 8.0, 12.0))
+}
+
+/// Draws a themed label box of exactly `(tw, th)` text size at top-left
+/// `(x, y)` — the fixed-size counterpart to `draw_label`, used where the
+/// box footprint must stay stable across frames (e.g. so hover-testing the
+/// save button doesn't jitter as its text content changes).
+fn draw_label_box(cr: &Context, x: f64, y: f64, tw: f64, th: f64, text: &str, theme: &Theme) {
+    select_font(cr);
     let pad = 6.0;
     let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
 
@@ -329,6 +487,54 @@ fn draw_label(cr: &Context, x: f64, y: f64, text: &str, theme: &Theme) {
     cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
     cr.move_to(x + pad, y + pad + th);
     let _ = cr.show_text(text);
+}
+
+/// Draws a themed label box. `x, y` is the box's top-left corner (not a
+/// text baseline), so callers can anchor it directly to a screen position
+/// — e.g. offset down-right of the cursor — without reasoning about font
+/// metrics.
+fn draw_label(cr: &Context, x: f64, y: f64, text: &str, theme: &Theme) {
+    let (tw, th) = measure_text(cr, text);
+    draw_label_box(cr, x, y, tw, th, text, theme);
+}
+
+/// A small hand-drawn camera glyph (no emoji font fallback needed) plus a
+/// "click to save" hint, drawn inside a fixed `(tw, th)` footprint so it
+/// doesn't resize relative to the plain size-readout box it replaces on
+/// hover.
+fn draw_camera_box(cr: &Context, x: f64, y: f64, tw: f64, th: f64, theme: &Theme) {
+    select_font(cr);
+    let pad = 6.0;
+    let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
+    let box_w = tw + pad * 2.0;
+    let box_h = th + pad * 2.0;
+
+    cr.set_source_rgba(bg.0, bg.1, bg.2, 0.9);
+    cr.rectangle(x, y, box_w, box_h);
+    let _ = cr.fill();
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.9);
+    cr.set_line_width(1.5);
+    cr.rectangle(x, y, box_w, box_h);
+    let _ = cr.stroke();
+
+    let icon_h = (box_h - 10.0).max(8.0);
+    let icon_w = icon_h * 1.4;
+    let icon_x = x + pad;
+    let icon_cy = y + box_h / 2.0;
+
+    cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
+    cr.rectangle(icon_x, icon_cy - icon_h / 2.0, icon_w, icon_h);
+    let _ = cr.fill();
+    cr.rectangle(icon_x + icon_w * 0.15, icon_cy - icon_h / 2.0 - icon_h * 0.22, icon_w * 0.35, icon_h * 0.22);
+    let _ = cr.fill();
+
+    cr.set_source_rgba(bg.0, bg.1, bg.2, 1.0);
+    cr.arc(icon_x + icon_w / 2.0, icon_cy, icon_h * 0.28, 0.0, std::f64::consts::TAU);
+    let _ = cr.fill();
+
+    cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
+    cr.move_to(icon_x + icon_w + 8.0, y + box_h - pad - 2.0);
+    let _ = cr.show_text("click to save");
 }
 
 fn draw_loupe(cr: &Context, st: &State, cx: f64, cy: f64, w: i32, _h: i32) {
@@ -425,7 +631,51 @@ fn draw_extent_bars(cr: &Context, theme: &Theme, cx: f64, cy: f64, l: f64, r: f6
     let _ = cr.fill();
 }
 
-fn draw(cr: &Context, _w: i32, h: i32, st: &State) {
+fn draw_rect_shape(cr: &Context, theme: &Theme, rect: Rect) {
+    let (l, t, r, b) = rect;
+    let ac = theme.accent;
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.10);
+    cr.rectangle(l, t, r - l, b - t);
+    let _ = cr.fill();
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.9);
+    cr.set_line_width(1.5);
+    cr.rectangle(l, t, r - l, b - t);
+    let _ = cr.stroke();
+}
+
+/// Places the size-readout box for a rectangle: centered inside it if it
+/// fits, otherwise centered below it. Optionally draws a ratio label
+/// beneath whichever box ends up lowest. Returns the size box's bounds.
+fn place_size_box(cr: &Context, theme: &Theme, rect: Rect, text: &str, show_ratio: bool) -> Rect {
+    let (l, t, r, b) = rect;
+    let (rect_w, rect_h) = (r - l, b - t);
+    let (tw, th) = measure_text(cr, text);
+    let pad = 6.0;
+    let (box_w, box_h) = (tw + pad * 2.0, th + pad * 2.0);
+
+    let (bx, by) = if box_w + 8.0 <= rect_w && box_h + 8.0 <= rect_h {
+        (l + (rect_w - box_w) / 2.0, t + (rect_h - box_h) / 2.0)
+    } else {
+        (l + (rect_w - box_w) / 2.0, b + 10.0)
+    };
+    draw_label_box(cr, bx, by, tw, th, text, theme);
+    let bounds = (bx, by, bx + box_w, by + box_h);
+
+    if show_ratio {
+        if let Some((num, den, exact)) = best_ratio(rect_w, rect_h) {
+            let prefix = if exact { "" } else { "~" };
+            let rtext = format!("{}{}:{}", prefix, num, den);
+            let (rtw, rth) = measure_text(cr, &rtext);
+            let stack_bottom = bounds.3.max(b);
+            let rx = l + (rect_w - (rtw + pad * 2.0)) / 2.0;
+            draw_label_box(cr, rx, stack_bottom + 8.0, rtw, rth, &rtext, theme);
+        }
+    }
+
+    bounds
+}
+
+fn draw(cr: &Context, _w: i32, h: i32, st: &State) -> Option<Rect> {
     // The screenshot itself is painted by a GdkTexture-backed Picture widget
     // underneath this transparent DrawingArea (composited by GSK, effectively
     // free per frame). This draw_func never touches the full viewport — every
@@ -433,38 +683,57 @@ fn draw(cr: &Context, _w: i32, h: i32, st: &State) {
     // independent of screen resolution and the redraw fast enough to track
     // the cursor without lag.
     let (cx, cy) = st.cursor;
+    let mut hover_box = None;
 
     match st.mode {
         Mode::Ruler => {
-            let size_text;
-            if let Some(start) = st.start {
-                let ac = st.theme.accent;
-                cr.set_source_rgba(ac.0, ac.1, ac.2, 0.95);
-                cr.set_line_width(1.5);
-                cr.move_to(start.0, start.1);
-                cr.line_to(cx, cy);
-                let _ = cr.stroke();
-                for (px, py) in [start, (cx, cy)] {
-                    cr.arc(px, py, 3.0, 0.0, std::f64::consts::TAU);
-                    let _ = cr.fill();
+            if let Some(rect) = st.snapped_rect {
+                draw_rect_shape(cr, &st.theme, rect);
+                let (l, t, r, b) = rect;
+                let size_text = format!("{:.0} x {:.0}", r - l, b - t);
+                let (tw, th) = measure_text(cr, &size_text);
+                let pad = 6.0;
+                let (rect_w, rect_h) = (r - l, b - t);
+                let (box_w, box_h) = (tw + pad * 2.0, th + pad * 2.0);
+                let (bx, by) = if box_w + 8.0 <= rect_w && box_h + 8.0 <= rect_h {
+                    (l + (rect_w - box_w) / 2.0, t + (rect_h - box_h) / 2.0)
+                } else {
+                    (l + (rect_w - box_w) / 2.0, b + 10.0)
+                };
+                let bounds = (bx, by, bx + box_w, by + box_h);
+
+                if point_in_rect((cx, cy), bounds) {
+                    draw_camera_box(cr, bx, by, tw, th, &st.theme);
+                } else {
+                    draw_label_box(cr, bx, by, tw, th, &size_text, &st.theme);
                 }
-                let dx = cx - start.0;
-                let dy = cy - start.1;
-                let dist = (dx * dx + dy * dy).sqrt();
-                size_text = format!("{:.0}px  ({:.0} x {:.0})", dist, dx.abs(), dy.abs());
+                hover_box = Some(bounds);
+
+                if let Some((num, den, exact)) = best_ratio(rect_w, rect_h) {
+                    let prefix = if exact { "" } else { "~" };
+                    let rtext = format!("{}{}:{}", prefix, num, den);
+                    let (rtw, rth) = measure_text(cr, &rtext);
+                    let stack_bottom = bounds.3.max(b);
+                    let rx = l + (rect_w - (rtw + pad * 2.0)) / 2.0;
+                    draw_label_box(cr, rx, stack_bottom + 8.0, rtw, rth, &rtext, &st.theme);
+                }
+            } else if st.dragging {
+                if let Some(start) = st.start {
+                    let rect = (start.0.min(cx), start.1.min(cy), start.0.max(cx), start.1.max(cy));
+                    draw_rect_shape(cr, &st.theme, rect);
+                    let text = format!("{:.0} x {:.0}", rect.2 - rect.0, rect.3 - rect.1);
+                    place_size_box(cr, &st.theme, rect, &text, true);
+                }
             } else {
-                let (l, r, t, b) = scan_extent_logical(st, cx, cy);
+                let (l, t, r, b) = scan_extent_logical(st, cx, cy);
                 draw_extent_bars(cr, &st.theme, cx, cy, l, r, t, b);
-                size_text = format!("{:.0} x {:.0}", r - l, b - t);
+                draw_label(cr, cx + 18.0, cy + 18.0, &format!("{:.0} x {:.0}", r - l, b - t), &st.theme);
             }
-            // Size readout in a box offset down-right of the cursor, out of
-            // the way of the measuring lines themselves.
-            draw_label(cr, cx + 18.0, cy + 18.0, &size_text, &st.theme);
 
             if st.show_legend {
                 let (_, tol_name) = TOLERANCE_LEVELS[st.tolerance_level];
                 let legend = format!(
-                    "tolerance: {}  ·  t: cycle  ·  drag: manual measure  ·  r: reset  ·  c: color  ·  s: snap {}  ·  l: hide legend  ·  esc: quit",
+                    "tolerance: {}  ·  t: cycle  ·  drag: select & snap  ·  hover box: save  ·  r: reset  ·  c: color  ·  s: snap {}  ·  l: hide legend  ·  esc: cancel/quit",
                     tol_name,
                     if st.snap_enabled { "on" } else { "off" }
                 );
@@ -484,6 +753,8 @@ fn draw(cr: &Context, _w: i32, h: i32, st: &State) {
     if let Some(msg) = &st.last_message {
         draw_label(cr, 16.0, h as f64 - 64.0, msg, &st.theme);
     }
+
+    hover_box
 }
 
 fn build_ui(app: &Application) {
@@ -537,6 +808,8 @@ fn build_ui(app: &Application) {
         mode: Mode::Ruler,
         dragging: false,
         start: None,
+        snapped_rect: None,
+        hover_box: None,
         snap_enabled: true,
         tolerance_level: DEFAULT_TOLERANCE_LEVEL,
         show_legend: true,
@@ -562,7 +835,8 @@ fn build_ui(app: &Application) {
     {
         let state = state.clone();
         area.set_draw_func(move |_area, cr, w, h| {
-            draw(cr, w, h, &state.borrow());
+            let hover = draw(cr, w, h, &state.borrow());
+            state.borrow_mut().hover_box = hover;
         });
     }
 
@@ -613,8 +887,17 @@ fn build_ui(app: &Application) {
             let mut st = state.borrow_mut();
             match st.mode {
                 Mode::Ruler => {
-                    st.start = Some(st.cursor);
-                    st.dragging = true;
+                    let hovering_save = st.snapped_rect.is_some()
+                        && st.hover_box.map_or(false, |hb| point_in_rect(st.cursor, hb));
+                    if hovering_save {
+                        if let Some(rect) = st.snapped_rect {
+                            save_selection(&st, rect);
+                        }
+                    } else {
+                        st.snapped_rect = None;
+                        st.start = Some(st.cursor);
+                        st.dragging = true;
+                    }
                 }
                 Mode::Color => {
                     let px = (st.cursor.0 * st.scale).round() as u32;
@@ -637,13 +920,25 @@ fn build_ui(app: &Application) {
             if st.mode == Mode::Ruler && st.dragging {
                 st.dragging = false;
                 if let Some(start) = st.start {
-                    let dx = st.cursor.0 - start.0;
-                    let dy = st.cursor.1 - start.1;
-                    let dist = (dx * dx + dy * dy).sqrt().round();
-                    let text = format!("{}px  (dx {:.0}, dy {:.0})", dist, dx, dy);
-                    copy_to_clipboard(&text);
-                    st.last_message = Some(format!("copied: {}", text));
+                    let l = start.0.min(st.cursor.0);
+                    let r = start.0.max(st.cursor.0);
+                    let t = start.1.min(st.cursor.1);
+                    let b = start.1.max(st.cursor.1);
+                    if r - l > 2.0 && b - t > 2.0 {
+                        let scale = st.scale;
+                        let prect = (
+                            (l * scale).round() as i64,
+                            (t * scale).round() as i64,
+                            (r * scale).round() as i64,
+                            (b * scale).round() as i64,
+                        );
+                        let tol = TOLERANCE_LEVELS[st.tolerance_level].0;
+                        let (nl, nt, nr, nb) = shrink_rect(&st.img, prect, tol);
+                        st.snapped_rect =
+                            Some((nl as f64 / scale, nt as f64 / scale, nr as f64 / scale, nb as f64 / scale));
+                    }
                 }
+                st.start = None;
             }
             drop(st);
             area.queue_draw();
@@ -659,7 +954,17 @@ fn build_ui(app: &Application) {
         key.connect_key_pressed(move |_c, keyval, _keycode, _modifier| {
             match keyval {
                 gdk::Key::Escape => {
-                    window.close();
+                    let mut st = state.borrow_mut();
+                    if st.mode == Mode::Ruler && (st.dragging || st.snapped_rect.is_some()) {
+                        st.dragging = false;
+                        st.start = None;
+                        st.snapped_rect = None;
+                        drop(st);
+                        area.queue_draw();
+                    } else {
+                        drop(st);
+                        window.close();
+                    }
                     glib::Propagation::Stop
                 }
                 gdk::Key::c | gdk::Key::C => {
@@ -667,6 +972,7 @@ fn build_ui(app: &Application) {
                     st.mode = if st.mode == Mode::Ruler { Mode::Color } else { Mode::Ruler };
                     st.dragging = false;
                     st.start = None;
+                    st.snapped_rect = None;
                     st.last_message = None;
                     drop(st);
                     area.queue_draw();
@@ -683,6 +989,7 @@ fn build_ui(app: &Application) {
                     let mut st = state.borrow_mut();
                     st.start = None;
                     st.dragging = false;
+                    st.snapped_rect = None;
                     drop(st);
                     area.queue_draw();
                     glib::Propagation::Stop
