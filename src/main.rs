@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -12,7 +13,8 @@ use gtk4::{
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use image::RgbaImage;
 
-const APP_ID: &str = "sh.omarchy.pixel-snap";
+const APP_NAME: &str = "omeasure";
+const APP_ID: &str = "sh.omarchy.omeasure";
 const TOLERANCE_LEVELS: [(u8, &str); 4] = [(0, "Off"), (10, "Low"), (24, "Med"), (48, "High")];
 const DEFAULT_TOLERANCE_LEVEL: usize = 1;
 const MAX_EXTENT_SCAN: i64 = 2000;
@@ -102,7 +104,7 @@ fn active_monitor() -> Option<MonitorInfo> {
 }
 
 fn capture_monitor(name: &str) -> Option<RgbaImage> {
-    let tmp = std::env::temp_dir().join(format!("pixel-snap-{}.png", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("{}-{}.png", APP_NAME, std::process::id()));
     let status = Command::new("grim").args(["-o", name]).arg(&tmp).status().ok()?;
     if !status.success() {
         return None;
@@ -149,7 +151,7 @@ fn fetch_theme() -> Theme {
 
 fn notify(headline: &str, description: &str) {
     let _ = Command::new("omarchy-notification-send")
-        .args(["--app-name", "Pixel ruler", "-u", "low", "-t", "1200", "-r", "48291"])
+        .args(["--app-name", APP_NAME, "-u", "low", "-t", "1200", "-r", "48291"])
         .arg(headline)
         .arg(description)
         .spawn();
@@ -282,13 +284,54 @@ fn scan_extent_logical(st: &State, cx: f64, cy: f64) -> Rect {
     (l as f64 / st.scale, t as f64 / st.scale, r as f64 / st.scale, b as f64 / st.scale)
 }
 
-/// The "snap to content" step for a dragged selection: each of the 4 edges
-/// independently shrinks inward from where the drag ended, using the color
-/// it started on (sampled at drag-release time) as its own reference, and
-/// stops the instant it hits a pixel that no longer matches — e.g. drag a
-/// loose box around a circle on white paper, and each edge eats through the
-/// white until it meets the circle. Every edge is capped at the rectangle's
-/// own center so opposing edges can't cross.
+/// The most common exact color along a line segment — either a column
+/// (`horizontal = false`, `fixed` = x) or a row (`horizontal = true`,
+/// `fixed` = y) — used as a background-color estimate for one edge of a
+/// selection. A single sampled point is too easy to land on noise or
+/// anti-aliasing right at the moment you release the drag; the mode of the
+/// whole line is much more representative of what the edge is actually
+/// sitting on.
+fn edge_mode_color(img: &RgbaImage, horizontal: bool, fixed: i64, from: i64, to: i64) -> (u8, u8, u8) {
+    let w = img.width() as i64;
+    let h = img.height() as i64;
+    let (lo, hi) = (from.min(to), from.max(to));
+    let mut counts: HashMap<(u8, u8, u8), u32> = HashMap::new();
+    for v in lo..=hi {
+        let (x, y) = if horizontal { (v, fixed) } else { (fixed, v) };
+        if x < 0 || y < 0 || x >= w || y >= h {
+            continue;
+        }
+        let (r, g, b, _) = rgba_at(img, x as u32, y as u32);
+        *counts.entry((r, g, b)).or_insert(0) += 1;
+    }
+    counts.into_iter().max_by_key(|(_, c)| *c).map(|(rgb, _)| rgb).unwrap_or((255, 255, 255))
+}
+
+/// Whether every pixel along a line segment matches `reference` within
+/// `tol`. Used to decide whether a whole row/column is still "background"
+/// and can be trimmed away.
+fn line_matches(img: &RgbaImage, horizontal: bool, fixed: i64, from: i64, to: i64, reference: (u8, u8, u8), tol: u8) -> bool {
+    let w = img.width() as i64;
+    let h = img.height() as i64;
+    let (lo, hi) = (from.min(to), from.max(to));
+    for v in lo..=hi {
+        let (x, y) = if horizontal { (v, fixed) } else { (fixed, v) };
+        if !color_close(img, x, y, w, h, reference, tol) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The "snap to content" step for a dragged selection. This is the same
+/// idea as ImageMagick's `-trim -fuzz` or GIMP's Autocrop: estimate each
+/// edge's background color, then only trim a row/column once the *entire*
+/// line is still within tolerance of it — not just one sampled point,
+/// which is what made the original version unreliable. All 4 edges shrink
+/// together, one step at a time, so a corner only stops where both its
+/// row and column actually disagree with the background; each edge is
+/// still capped at the rectangle's own center so opposing edges can't
+/// cross.
 fn shrink_rect(img: &RgbaImage, rect: (i64, i64, i64, i64), tol: u8) -> (i64, i64, i64, i64) {
     let w = img.width() as i64;
     let h = img.height() as i64;
@@ -304,46 +347,35 @@ fn shrink_rect(img: &RgbaImage, rect: (i64, i64, i64, i64), tol: u8) -> (i64, i6
     let mid_x = (l + r) / 2;
     let mid_y = (t + b) / 2;
 
-    let left_ref = {
-        let (r, g, b, _) = rgba_at(img, l as u32, mid_y as u32);
-        (r, g, b)
-    };
-    let right_ref = {
-        let (r, g, b, _) = rgba_at(img, r as u32, mid_y as u32);
-        (r, g, b)
-    };
-    let top_ref = {
-        let (r, g, b, _) = rgba_at(img, mid_x as u32, t as u32);
-        (r, g, b)
-    };
-    let bottom_ref = {
-        let (r, g, b, _) = rgba_at(img, mid_x as u32, b as u32);
-        (r, g, b)
-    };
+    let left_ref = edge_mode_color(img, false, l, t, b);
+    let right_ref = edge_mode_color(img, false, r, t, b);
+    let top_ref = edge_mode_color(img, true, t, l, r);
+    let bottom_ref = edge_mode_color(img, true, b, l, r);
 
-    let mut nl = l;
-    let mut steps = 0;
-    while steps < MAX_EXTENT_SCAN && nl + 1 < mid_x && color_close(img, nl + 1, mid_y, w, h, left_ref, tol) {
-        nl += 1;
-        steps += 1;
-    }
-    let mut nr = r;
-    steps = 0;
-    while steps < MAX_EXTENT_SCAN && nr - 1 > mid_x && color_close(img, nr - 1, mid_y, w, h, right_ref, tol) {
-        nr -= 1;
-        steps += 1;
-    }
-    let mut nt = t;
-    steps = 0;
-    while steps < MAX_EXTENT_SCAN && nt + 1 < mid_y && color_close(img, mid_x, nt + 1, w, h, top_ref, tol) {
-        nt += 1;
-        steps += 1;
-    }
-    let mut nb = b;
-    steps = 0;
-    while steps < MAX_EXTENT_SCAN && nb - 1 > mid_y && color_close(img, mid_x, nb - 1, w, h, bottom_ref, tol) {
-        nb -= 1;
-        steps += 1;
+    let (mut nl, mut nr, mut nt, mut nb) = (l, r, t, b);
+    let mut iterations = 0;
+    loop {
+        let mut changed = false;
+        if nl + 1 < mid_x && line_matches(img, false, nl + 1, nt, nb, left_ref, tol) {
+            nl += 1;
+            changed = true;
+        }
+        if nr - 1 > mid_x && line_matches(img, false, nr - 1, nt, nb, right_ref, tol) {
+            nr -= 1;
+            changed = true;
+        }
+        if nt + 1 < mid_y && line_matches(img, true, nt + 1, nl, nr, top_ref, tol) {
+            nt += 1;
+            changed = true;
+        }
+        if nb - 1 > mid_y && line_matches(img, true, nb - 1, nl, nr, bottom_ref, tol) {
+            nb -= 1;
+            changed = true;
+        }
+        iterations += 1;
+        if !changed || iterations >= MAX_EXTENT_SCAN {
+            break;
+        }
     }
     (nl, nt, nr, nb)
 }
@@ -407,12 +439,12 @@ fn save_selection(st: &State, rect: Rect) {
     let cropped = image::imageops::crop_imm(&st.img, pl, pt, w, h).to_image();
 
     let Ok(home) = std::env::var("HOME") else {
-        notify("Pixel ruler", "Could not resolve $HOME to save image");
+        notify(APP_NAME, "Could not resolve $HOME to save image");
         return;
     };
     let dir = format!("{}/Pictures/Screenshots", home);
     if std::fs::create_dir_all(&dir).is_err() {
-        notify("Pixel ruler", "Failed to create Pictures/Screenshots");
+        notify(APP_NAME, "Failed to create Pictures/Screenshots");
         return;
     }
 
@@ -424,12 +456,12 @@ fn save_selection(st: &State, rect: Rect) {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "output".to_string());
 
-    let path = format!("{}/pixel-snap-{}.png", dir, ts);
+    let path = format!("{}/{}-{}.png", dir, APP_NAME, ts);
     if cropped.save(&path).is_ok() {
         copy_to_clipboard(&path);
-        notify("Pixel ruler", &format!("Saved {}x{} to {}", w, h, path));
+        notify(APP_NAME, &format!("Saved {}x{} to {}", w, h, path));
     } else {
-        notify("Pixel ruler", "Failed to save image");
+        notify(APP_NAME, "Failed to save image");
     }
 }
 
@@ -496,6 +528,56 @@ fn draw_label_box(cr: &Context, x: f64, y: f64, tw: f64, th: f64, text: &str, th
 fn draw_label(cr: &Context, x: f64, y: f64, text: &str, theme: &Theme) {
     let (tw, th) = measure_text(cr, text);
     draw_label_box(cr, x, y, tw, th, text, theme);
+}
+
+/// The bottom hint bar. Shows the tolerance cycle as `off / low / med /
+/// high` with the active level highlighted (rather than just naming the
+/// current value), so the whole range and where you are in it is visible
+/// at a glance — plus the remaining controls, kept short since Escape and
+/// window-close conventions don't need spelling out.
+fn draw_legend(cr: &Context, x: f64, y: f64, theme: &Theme, tolerance_level: usize) {
+    let pad = 6.0;
+    select_font(cr);
+    let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
+
+    let mut segments: Vec<(String, bool)> = vec![("tolerance(t): ".to_string(), false)];
+    for (i, (_, name)) in TOLERANCE_LEVELS.iter().enumerate() {
+        if i > 0 {
+            segments.push((" / ".to_string(), false));
+        }
+        segments.push((name.to_lowercase(), i == tolerance_level));
+    }
+    segments.push(("   ·   drag: select & snap   ·   r: reset   ·   c: color   ·   l: hide legend".to_string(), false));
+
+    let widths: Vec<f64> = segments.iter().map(|(text, _)| measure_text(cr, text).0).collect();
+    let (_, line_h) = measure_text(cr, "Ag");
+    let total_w: f64 = widths.iter().sum();
+    let box_w = total_w + pad * 2.0;
+    let box_h = line_h + pad * 2.0;
+
+    cr.set_source_rgba(bg.0, bg.1, bg.2, 0.85);
+    cr.rectangle(x, y, box_w, box_h);
+    let _ = cr.fill();
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.5);
+    cr.set_line_width(1.0);
+    cr.rectangle(x, y, box_w, box_h);
+    let _ = cr.stroke();
+
+    let mut run_x = x + pad;
+    let text_y = y + pad + line_h;
+    for ((text, highlighted), w) in segments.iter().zip(widths.iter()) {
+        if *highlighted {
+            cr.set_source_rgba(ac.0, ac.1, ac.2, 0.9);
+            cr.rectangle(run_x - 2.0, y + 3.0, w + 4.0, box_h - 6.0);
+            let _ = cr.fill();
+            cr.set_source_rgba(bg.0, bg.1, bg.2, 1.0);
+        } else {
+            cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
+        }
+        cr.move_to(run_x, text_y);
+        let _ = cr.show_text(text);
+        run_x += w;
+    }
 }
 
 /// A small hand-drawn camera glyph (no emoji font fallback needed) plus a
@@ -731,13 +813,7 @@ fn draw(cr: &Context, _w: i32, h: i32, st: &State) -> Option<Rect> {
             }
 
             if st.show_legend {
-                let (_, tol_name) = TOLERANCE_LEVELS[st.tolerance_level];
-                let legend = format!(
-                    "tolerance: {}  ·  t: cycle  ·  drag: select & snap  ·  hover box: save  ·  r: reset  ·  c: color  ·  s: snap {}  ·  l: hide legend  ·  esc: cancel/quit",
-                    tol_name,
-                    if st.snap_enabled { "on" } else { "off" }
-                );
-                draw_label(cr, 16.0, h as f64 - 38.0, &legend, &st.theme);
+                draw_legend(cr, 16.0, h as f64 - 38.0, &st.theme, st.tolerance_level);
             }
         }
         Mode::Color => {
@@ -759,11 +835,11 @@ fn draw(cr: &Context, _w: i32, h: i32, st: &State) -> Option<Rect> {
 
 fn build_ui(app: &Application) {
     let Some(monitor) = active_monitor() else {
-        eprintln!("pixel-snap: could not read monitor list from hyprctl");
+        eprintln!("{}: could not read monitor list from hyprctl", APP_NAME);
         std::process::exit(1);
     };
     let Some(img) = capture_monitor(&monitor.name) else {
-        eprintln!("pixel-snap: grim capture failed for output {}", monitor.name);
+        eprintln!("{}: grim capture failed for output {}", APP_NAME, monitor.name);
         std::process::exit(1);
     };
     let (grad, gw, gh) = compute_gradient(&img);
@@ -780,8 +856,18 @@ fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .decorated(false)
-        .title("pixel-snap")
+        .title(APP_NAME)
         .build();
+
+    // The system cursor is rendered by the compositor via a low-latency
+    // hardware-cursor path, completely separate from our own client-side
+    // redraw. Leaving it visible means there are always two pointers on
+    // screen — the real one and ours — and ours will always look laggy by
+    // comparison no matter how fast we redraw, because it's going through
+    // a fundamentally slower path (client damage -> compositor repaint).
+    // Hiding it makes our drawn indicator the only pointer, which is what
+    // actually removes the perceived lag.
+    window.set_cursor_from_name(Some("none"));
 
     window.init_layer_shell();
     window.set_namespace(Some(APP_ID));
