@@ -66,13 +66,20 @@ crosshair is, with its length labeled above/beside it. Lines stay on screen
 so you can pin several at once and read them all together; labels nudge
 out of each other's way if two would otherwise overlap.
 
-**Guides** (Shift+`h` / Shift+`v`): pin a plain alignment guide — no
-measurement, just a line — snapped to the nearest actual color change in
+**Guides** (Shift+`h` / Shift+`v`): enters guide-placement mode — the cursor
+switches to a row-resize/col-resize icon, and a line follows it across the
+full width (or height) of the screen. While placing, the space on either
+side of the line is read out in small type on the left edge of the screen
+(top edge for a vertical guide), vertically/horizontally centered in each
+segment — same idea as dragging a guide off the ruler in Figma or Sketch.
+Click to commit it: the guide snaps to the nearest actual color change in
 that axis (top/bottom for a horizontal guide, left/right for a vertical
-one), rendered in a distinct color from measure lines. Guides also bound
-every other measurement: the idle crosshair and pinned measure lines will
-stop at the nearest guide instead of reading past it, even where there's no
-real color change there.
+one) and mode returns to Ruler. `Escape` cancels placement without adding
+one. Guides render in a distinct color from measure lines, and the same
+edge-distance readout stays pinned on screen for every committed guide, not
+just the one being placed. Guides also bound every other measurement: the
+idle crosshair and pinned measure lines will stop at the nearest guide
+instead of reading past it, even where there's no real color change there.
 
 **Alignment lines** (hold Shift): a full-screen crosshair through the
 cursor for eyeballing visual alignment — no color sampling, no readout, just
@@ -92,7 +99,7 @@ close.
 | Click + drag | Draw a selection rectangle, snaps to content on release — repeatable for multi-select |
 | Hover snapped box | Shows a camera button — click to open in `omasnap` |
 | `h` / `v` | Pin a horizontal / vertical measure line at the cursor |
-| Shift+`h` / Shift+`v` | Pin a horizontal / vertical guide, snapped to the nearest color edge |
+| Shift+`h` / Shift+`v` | Enter guide-placement mode; click to commit (snaps to nearest color edge), `Escape` to cancel |
 | Hold Shift | Full-screen alignment crosshair (no measurement) |
 | Arrow keys | Nudge cursor 1px (hold Shift for 10px) |
 | `c` | Copy the active selection, or toggle color-picker mode if none |

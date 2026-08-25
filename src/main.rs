@@ -27,6 +27,14 @@ const RATIO_EXACT_ERROR: f64 = 0.005;
 enum Mode {
     Ruler,
     Color,
+    /// Placing a horizontal guide: a live line follows the cursor's Y, with
+    /// the space above/below it read out on the left edge of the screen,
+    /// until a click commits it (snapped to the nearest color edge) and
+    /// mode returns to Ruler.
+    GuideH,
+    /// The vertical-guide counterpart: line follows cursor X, readouts on
+    /// the top edge.
+    GuideV,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -47,6 +55,10 @@ struct Theme {
     /// thing from the accent-colored measuring lines/selections — matches
     /// the design-tool convention (Figma/Sketch) of guides in pink/magenta.
     guide: (f64, f64, f64),
+    /// Distinct color for pinned measure lines (h/v), so they read as a
+    /// different kind of thing from both the accent-colored live ruler
+    /// crosshair and the guide color.
+    measure: (f64, f64, f64),
 }
 
 struct MonitorInfo {
@@ -179,6 +191,7 @@ fn fetch_theme() -> Theme {
         foreground: theme_color_rgb("foreground", (1.0, 1.0, 1.0)),
         background: theme_color_rgb("background", (0.0, 0.0, 0.0)),
         guide: theme_color_rgb("magenta", (1.0, 0.2, 0.6)),
+        measure: theme_color_rgb("cyan", (0.2, 0.85, 0.9)),
     }
 }
 
@@ -234,6 +247,19 @@ fn show_legend_selection() {
         .spawn();
 }
 
+/// Legend shown while placing a guide (`Mode::GuideH`/`GuideV`) — `c`/`s`
+/// and the rest of the idle/selection hints don't apply here, only
+/// committing or canceling the guide do.
+fn show_legend_guide() {
+    let _ = Command::new("omarchy-legend")
+        .args([
+            "-e", "click:place guide",
+            "-e", "esc:cancel",
+            "-c", "top-right",
+        ])
+        .spawn();
+}
+
 fn hide_legend_card() {
     let _ = Command::new("omarchy-legend").arg("--hide").spawn();
 }
@@ -241,16 +267,22 @@ fn hide_legend_card() {
 /// Picks the right legend variant (or hides it) for the current state.
 /// Called at every transition that could change which one applies: a
 /// selection being made or cleared, the `l` toggle, entering/leaving Color
-/// mode.
+/// or guide-placement mode.
 fn refresh_legend(st: &State) {
-    if !st.show_legend || st.mode != Mode::Ruler {
+    if !st.show_legend {
         hide_legend_card();
         return;
     }
-    if st.snapped_rects.is_empty() {
-        show_legend_idle();
-    } else {
-        show_legend_selection();
+    match st.mode {
+        Mode::Ruler => {
+            if st.snapped_rects.is_empty() {
+                show_legend_idle();
+            } else {
+                show_legend_selection();
+            }
+        }
+        Mode::GuideH | Mode::GuideV => show_legend_guide(),
+        Mode::Color => hide_legend_card(),
     }
 }
 
@@ -711,8 +743,16 @@ fn point_in_rect(p: (f64, f64), r: Rect) -> bool {
 /// a visible cursor makes it much easier to land a click on the small
 /// hover-to-open box.
 fn sync_cursor_visibility(window: &ApplicationWindow, st: &State) {
-    let visible = st.mode == Mode::Ruler && !st.snapped_rects.is_empty();
-    window.set_cursor_from_name(Some(if visible { "default" } else { "none" }));
+    // GuideH/GuideV use the standard row-resize/col-resize cursors (a
+    // double-headed arrow with a bar through it) so placing a guide looks
+    // and feels like dragging one out of a ruler in any other design tool.
+    let name = match st.mode {
+        Mode::Ruler if !st.snapped_rects.is_empty() => "default",
+        Mode::GuideH => "row-resize",
+        Mode::GuideV => "col-resize",
+        _ => "none",
+    };
+    window.set_cursor_from_name(Some(name));
 }
 
 fn find_gdk_monitor(window: &ApplicationWindow, name: &str) -> Option<gdk::Monitor> {
@@ -786,6 +826,46 @@ fn draw_label_box(cr: &Context, x: f64, y: f64, tw: f64, th: f64, text: &str, th
 fn draw_label(cr: &Context, x: f64, y: f64, text: &str, theme: &Theme) {
     let (tw, th) = measure_text(cr, text);
     draw_label_box(cr, x, y, tw, th, text, theme);
+}
+
+const SMALL_FONT_SIZE: f64 = 8.0;
+
+fn select_font_sized(cr: &Context, size: f64) {
+    let _ = cr.select_font_face(
+        "monospace",
+        gtk4::cairo::FontSlant::Normal,
+        gtk4::cairo::FontWeight::Normal,
+    );
+    cr.set_font_size(size);
+}
+
+fn measure_text_sized(cr: &Context, text: &str, size: f64) -> (f64, f64) {
+    select_font_sized(cr, size);
+    cr.text_extents(text)
+        .map(|e| (e.x_advance(), e.height()))
+        .unwrap_or((text.len() as f64 * size * 0.7, size))
+}
+
+/// Same idea as `draw_label_box` but at `SMALL_FONT_SIZE` — used for the
+/// guide edge-distance readouts, which are meant to read as a quieter,
+/// secondary measurement rather than the main W x H-style readout.
+fn draw_small_label_box(cr: &Context, x: f64, y: f64, tw: f64, th: f64, text: &str, theme: &Theme) {
+    select_font_sized(cr, SMALL_FONT_SIZE);
+    let pad = 4.0;
+    let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
+
+    cr.set_source_rgba(bg.0, bg.1, bg.2, 0.85);
+    cr.rectangle(x, y, tw + pad * 2.0, th + pad * 2.0);
+    let _ = cr.fill();
+
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.35);
+    cr.set_line_width(1.0);
+    cr.rectangle(x, y, tw + pad * 2.0, th + pad * 2.0);
+    let _ = cr.stroke();
+
+    cr.set_source_rgba(fg.0, fg.1, fg.2, 0.9);
+    cr.move_to(x + pad, y + pad + th);
+    let _ = cr.show_text(text);
 }
 
 fn rects_overlap(a: Rect, b: Rect) -> bool {
@@ -951,7 +1031,7 @@ fn draw_extent_bars(cr: &Context, theme: &Theme, cx: f64, cy: f64, l: f64, r: f6
 /// guide, which spans the full screen), with the size centered above it.
 fn draw_pinned_h(cr: &Context, theme: &Theme, occupied: &mut Vec<Rect>, line: HLine) {
     let (y, l, r) = line;
-    let ac = theme.accent;
+    let ac = theme.measure;
     cr.set_source_rgba(ac.0, ac.1, ac.2, 0.95);
     cr.set_line_width(1.5);
     cr.move_to(l, y);
@@ -973,7 +1053,7 @@ fn draw_pinned_h(cr: &Context, theme: &Theme, occupied: &mut Vec<Rect>, line: HL
 /// A pinned vertical measure line, label to the right, vertically centered.
 fn draw_pinned_v(cr: &Context, theme: &Theme, occupied: &mut Vec<Rect>, line: VLine) {
     let (x, t, b) = line;
-    let ac = theme.accent;
+    let ac = theme.measure;
     cr.set_source_rgba(ac.0, ac.1, ac.2, 0.95);
     cr.set_line_width(1.5);
     cr.move_to(x, t);
@@ -1004,6 +1084,83 @@ fn draw_guide_v(cr: &Context, theme: &Theme, x: f64, screen_h: i32) {
     cr.move_to(x, 0.0);
     cr.line_to(x, screen_h as f64);
     let _ = cr.stroke();
+}
+
+/// The not-yet-committed guide line while in `Mode::GuideH`/`GuideV`,
+/// brighter and slightly thicker than a pinned guide so it reads as "still
+/// following the cursor" rather than placed.
+fn draw_guide_h_live(cr: &Context, theme: &Theme, y: f64, screen_w: i32) {
+    let gc = theme.guide;
+    cr.set_source_rgba(gc.0, gc.1, gc.2, 1.0);
+    cr.set_line_width(1.5);
+    cr.move_to(0.0, y);
+    cr.line_to(screen_w as f64, y);
+    let _ = cr.stroke();
+}
+
+fn draw_guide_v_live(cr: &Context, theme: &Theme, x: f64, screen_h: i32) {
+    let gc = theme.guide;
+    cr.set_source_rgba(gc.0, gc.1, gc.2, 1.0);
+    cr.set_line_width(1.5);
+    cr.move_to(x, 0.0);
+    cr.line_to(x, screen_h as f64);
+    let _ = cr.stroke();
+}
+
+/// For every gap between consecutive horizontal guides — including the top
+/// and bottom screen edges as implicit boundaries — draws a small "gap
+/// size" readout on the left edge of the screen, vertically centered in
+/// that gap. Called both for the committed `guides_h` set (in Ruler mode)
+/// and, with the live cursor position appended, as the placement preview
+/// while in `Mode::GuideH`.
+fn draw_guide_gaps_h(cr: &Context, theme: &Theme, guides: &[f64], screen_h: i32) {
+    if guides.is_empty() {
+        return;
+    }
+    let mut ys: Vec<f64> = guides.to_vec();
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut bounds = vec![0.0];
+    bounds.extend(ys);
+    bounds.push(screen_h as f64);
+    for w in bounds.windows(2) {
+        let (top, bottom) = (w[0], w[1]);
+        let gap = bottom - top;
+        if gap < 1.0 {
+            continue;
+        }
+        let text = format!("{:.0}px", gap);
+        let (tw, th) = measure_text_sized(cr, &text, SMALL_FONT_SIZE);
+        let pad = 4.0;
+        let bx = 8.0;
+        let by = (top + bottom) / 2.0 - (th + pad * 2.0) / 2.0;
+        draw_small_label_box(cr, bx, by, tw, th, &text, theme);
+    }
+}
+
+/// The vertical-guide counterpart: gaps read out along the top edge,
+/// horizontally centered in each gap.
+fn draw_guide_gaps_v(cr: &Context, theme: &Theme, guides: &[f64], screen_w: i32) {
+    if guides.is_empty() {
+        return;
+    }
+    let mut xs: Vec<f64> = guides.to_vec();
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut bounds = vec![0.0];
+    bounds.extend(xs);
+    bounds.push(screen_w as f64);
+    for w in bounds.windows(2) {
+        let (left, right) = (w[0], w[1]);
+        let gap = right - left;
+        if gap < 1.0 {
+            continue;
+        }
+        let text = format!("{:.0}px", gap);
+        let (tw, th) = measure_text_sized(cr, &text, SMALL_FONT_SIZE);
+        let pad = 4.0;
+        let by = 8.0;
+        let bx = (left + right) / 2.0 - (tw + pad * 2.0) / 2.0;
+        draw_small_label_box(cr, bx, by, tw, th, &text, theme);
+    }
 }
 
 /// Shift held, no h/v: full-screen crosshair with no color computation and
@@ -1127,6 +1284,8 @@ fn draw(cr: &Context, w: i32, h: i32, st: &State) -> Option<Rect> {
             for &gx in &st.guides_v {
                 draw_guide_v(cr, &st.theme, gx, h);
             }
+            draw_guide_gaps_h(cr, &st.theme, &st.guides_h, h);
+            draw_guide_gaps_v(cr, &st.theme, &st.guides_v, w);
             for &line in &st.measure_lines_h {
                 draw_pinned_h(cr, &st.theme, &mut occupied, line);
             }
@@ -1158,6 +1317,24 @@ fn draw(cr: &Context, w: i32, h: i32, st: &State) -> Option<Rect> {
                 let text = format!("{:.0} x {:.0}", r - l, b - t);
                 place_label(cr, &mut occupied, cx + 18.0, cy + 18.0, &text, &st.theme);
             }
+        }
+        Mode::GuideH => {
+            for &gy in &st.guides_h {
+                draw_guide_h(cr, &st.theme, gy, w);
+            }
+            draw_guide_h_live(cr, &st.theme, cy, w);
+            let mut all = st.guides_h.clone();
+            all.push(cy);
+            draw_guide_gaps_h(cr, &st.theme, &all, h);
+        }
+        Mode::GuideV => {
+            for &gx in &st.guides_v {
+                draw_guide_v(cr, &st.theme, gx, h);
+            }
+            draw_guide_v_live(cr, &st.theme, cx, h);
+            let mut all = st.guides_v.clone();
+            all.push(cx);
+            draw_guide_gaps_v(cr, &st.theme, &all, w);
         }
         Mode::Color => {
             draw_loupe(cr, st, cx, cy, w, h);
@@ -1343,6 +1520,28 @@ fn build_ui(app: &Application) {
                         st.last_message = Some(format!("copied {}", hex));
                     }
                 }
+                Mode::GuideH => {
+                    let px = (st.cursor.0 * st.scale).round() as i64;
+                    let py = (st.cursor.1 * st.scale).round() as i64;
+                    let tol = TOLERANCE_LEVELS[st.tolerance_level].0;
+                    let snapped = nearest_edge_vertical(&st.img, px, py, tol);
+                    let y = snapped as f64 / st.scale;
+                    st.guides_h.push(y);
+                    st.undo_stack.push(UndoItem::GuideH);
+                    st.mode = Mode::Ruler;
+                    refresh_legend(&st);
+                }
+                Mode::GuideV => {
+                    let px = (st.cursor.0 * st.scale).round() as i64;
+                    let py = (st.cursor.1 * st.scale).round() as i64;
+                    let tol = TOLERANCE_LEVELS[st.tolerance_level].0;
+                    let snapped = nearest_edge_horizontal(&st.img, px, py, tol);
+                    let x = snapped as f64 / st.scale;
+                    st.guides_v.push(x);
+                    st.undo_stack.push(UndoItem::GuideV);
+                    st.mode = Mode::Ruler;
+                    refresh_legend(&st);
+                }
             }
             sync_cursor_visibility(&window, &st);
             drop(st);
@@ -1397,6 +1596,14 @@ fn build_ui(app: &Application) {
             match keyval {
                 gdk::Key::Escape => {
                     let mut st = state.borrow_mut();
+                    if matches!(st.mode, Mode::GuideH | Mode::GuideV) {
+                        st.mode = Mode::Ruler;
+                        sync_cursor_visibility(&window, &st);
+                        refresh_legend(&st);
+                        drop(st);
+                        area.queue_draw();
+                        return glib::Propagation::Stop;
+                    }
                     let has_anything = st.mode == Mode::Ruler
                         && (st.dragging
                             || !st.snapped_rects.is_empty()
@@ -1459,6 +1666,7 @@ fn build_ui(app: &Application) {
                 }
                 gdk::Key::r | gdk::Key::R => {
                     let mut st = state.borrow_mut();
+                    st.mode = Mode::Ruler;
                     st.start = None;
                     st.dragging = false;
                     st.snapped_rects.clear();
@@ -1534,13 +1742,9 @@ fn build_ui(app: &Application) {
                         return glib::Propagation::Proceed;
                     }
                     if shift {
-                        let px = (st.cursor.0 * st.scale).round() as i64;
-                        let py = (st.cursor.1 * st.scale).round() as i64;
-                        let tol = TOLERANCE_LEVELS[st.tolerance_level].0;
-                        let snapped = nearest_edge_vertical(&st.img, px, py, tol);
-                        let y = snapped as f64 / st.scale;
-                        st.guides_h.push(y);
-                        st.undo_stack.push(UndoItem::GuideH);
+                        st.mode = Mode::GuideH;
+                        sync_cursor_visibility(&window, &st);
+                        refresh_legend(&st);
                     } else {
                         let (l, _t, r, _b) = scan_extent_logical(&st, st.cursor.0, st.cursor.1);
                         let y = st.cursor.1;
@@ -1557,13 +1761,9 @@ fn build_ui(app: &Application) {
                         return glib::Propagation::Proceed;
                     }
                     if shift {
-                        let px = (st.cursor.0 * st.scale).round() as i64;
-                        let py = (st.cursor.1 * st.scale).round() as i64;
-                        let tol = TOLERANCE_LEVELS[st.tolerance_level].0;
-                        let snapped = nearest_edge_horizontal(&st.img, px, py, tol);
-                        let x = snapped as f64 / st.scale;
-                        st.guides_v.push(x);
-                        st.undo_stack.push(UndoItem::GuideV);
+                        st.mode = Mode::GuideV;
+                        sync_cursor_visibility(&window, &st);
+                        refresh_legend(&st);
                     } else {
                         let (_l, t, _r, b) = scan_extent_logical(&st, st.cursor.0, st.cursor.1);
                         let x = st.cursor.0;
