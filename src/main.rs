@@ -116,6 +116,32 @@ const DUCK_HIT_RADIUS: f64 = 22.0;
 /// circle, closer to aiming a rifle than requiring a pixel-perfect click.
 const CURSOR_AIM_RADIUS: f64 = 26.0;
 const DUCK_LIFETIME: std::time::Duration = std::time::Duration::from_secs(15);
+/// Pause between one duck being gone (killed or escaped) and the next one
+/// spawning, so kills read as discrete rounds rather than an instant swap.
+const DUCK_RESPAWN_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Plain-text high score, one integer, in the XDG data dir — small enough
+/// state that hand-rolling this beats pulling in a config/serialization
+/// crate for it.
+fn high_score_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::PathBuf::from(home).join(".local/share/omaruler/highscore"))
+}
+
+fn load_high_score() -> u32 {
+    high_score_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn save_high_score(score: u32) {
+    let Some(path) = high_score_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, score.to_string());
+}
 
 fn spawn_duck(screen_w: f64, screen_h: f64) -> Duck {
     let seed = std::time::SystemTime::now()
@@ -276,6 +302,13 @@ struct State {
     last_message: Option<String>,
     /// Easter egg (`d`) — see `Duck`/`spawn_duck`/`update_duck`/`draw_duck`.
     duck: Option<Duck>,
+    /// `Some(deadline)` between one duck being gone and the next spawning —
+    /// distinct from `duck.is_none()` at rest (game off) so the tick
+    /// callback and the `d`/Escape/`r` handlers can tell "mid-round,
+    /// waiting to respawn" apart from "not playing".
+    duck_next_spawn: Option<std::time::Instant>,
+    duck_score: u32,
+    duck_high_score: u32,
 }
 
 fn rgba_at(img: &RgbaImage, x: u32, y: u32) -> (u8, u8, u8, u8) {
@@ -1720,6 +1753,9 @@ fn build_ui(app: &Application) {
         undo_stack: Vec::new(),
         last_message: None,
         duck: None,
+        duck_next_spawn: None,
+        duck_score: 0,
+        duck_high_score: load_high_score(),
     }));
 
     let picture = Picture::for_paintable(&texture);
@@ -1792,22 +1828,36 @@ fn build_ui(app: &Application) {
             // Easter egg: the duck flies continuously (not just in
             // response to cursor motion), so it needs its own unconditional
             // per-frame update independent of the pointer-driven redraw
-            // logic above.
+            // logic above. Also handles the post-kill/post-miss respawn
+            // timer and the "flew away untouched" timeout.
             {
                 let mut st = state.borrow_mut();
-                let expired = st.duck.as_ref().is_some_and(|d| d.spawned.elapsed() >= DUCK_LIFETIME);
-                if expired {
-                    st.duck = None;
-                    drop(st);
-                    flash_status("The duck got away!");
-                    area.queue_draw();
-                } else if st.duck.is_some() {
+                let now = std::time::Instant::now();
+
+                if st.duck.is_none() && st.duck_next_spawn.is_some_and(|t| now >= t) {
                     let screen_w = st.img.width() as f64 / st.scale;
                     let screen_h = st.img.height() as f64 / st.scale;
-                    if let Some(duck) = st.duck.as_mut() {
-                        update_duck(duck, screen_w, screen_h);
-                    }
-                    drop(st);
+                    st.duck = Some(spawn_duck(screen_w, screen_h));
+                    st.duck_next_spawn = None;
+                }
+
+                let mut miss_message = None;
+                let screen_w = st.img.width() as f64 / st.scale;
+                let screen_h = st.img.height() as f64 / st.scale;
+                if st.duck.as_ref().is_some_and(|d| d.spawned.elapsed() >= DUCK_LIFETIME) {
+                    st.duck = None;
+                    st.duck_next_spawn = Some(now + DUCK_RESPAWN_DELAY);
+                    miss_message = Some(format!("The duck got away! Score: {}", st.duck_score));
+                } else if let Some(duck) = st.duck.as_mut() {
+                    update_duck(duck, screen_w, screen_h);
+                }
+
+                let should_redraw = st.duck.is_some() || st.duck_next_spawn.is_some() || miss_message.is_some();
+                drop(st);
+                if let Some(msg) = miss_message {
+                    flash_status(&msg);
+                }
+                if should_redraw {
                     area.queue_draw();
                 }
             }
@@ -1825,8 +1875,17 @@ fn build_ui(app: &Application) {
             let mut st = state.borrow_mut();
             if st.duck.as_ref().is_some_and(|d| duck_hit(d, st.cursor)) {
                 st.duck = None;
+                st.duck_next_spawn = Some(std::time::Instant::now() + DUCK_RESPAWN_DELAY);
+                st.duck_score += 1;
+                let msg = if st.duck_score > st.duck_high_score {
+                    st.duck_high_score = st.duck_score;
+                    save_high_score(st.duck_high_score);
+                    format!("🦆 New high score: {}!", st.duck_score)
+                } else {
+                    format!("🦆 Quack! Score: {}", st.duck_score)
+                };
                 drop(st);
-                flash_status("🦆 Quack!");
+                flash_status(&msg);
                 area.queue_draw();
                 return;
             }
@@ -1931,6 +1990,7 @@ fn build_ui(app: &Application) {
                         return glib::Propagation::Stop;
                     }
                     let has_anything = st.duck.is_some()
+                        || st.duck_next_spawn.is_some()
                         || (st.mode == Mode::Ruler
                             && (st.dragging
                                 || !st.snapped_rects.is_empty()
@@ -1948,6 +2008,8 @@ fn build_ui(app: &Application) {
                         st.measure_lines_v.clear();
                         st.undo_stack.clear();
                         st.duck = None;
+                        st.duck_next_spawn = None;
+                        st.duck_score = 0;
                         sync_cursor_visibility(&window, &st);
                         refresh_legend(&st);
                         drop(st);
@@ -2004,6 +2066,8 @@ fn build_ui(app: &Application) {
                     st.measure_lines_v.clear();
                     st.undo_stack.clear();
                     st.duck = None;
+                    st.duck_next_spawn = None;
+                    st.duck_score = 0;
                     sync_cursor_visibility(&window, &st);
                     refresh_legend(&st);
                     drop(st);
@@ -2068,14 +2132,25 @@ fn build_ui(app: &Application) {
                 // Easter egg — deliberately not in the legend.
                 gdk::Key::d | gdk::Key::D => {
                     let mut st = state.borrow_mut();
-                    if st.duck.is_some() {
+                    let playing = st.duck.is_some() || st.duck_next_spawn.is_some();
+                    let mut msg = None;
+                    if playing {
                         st.duck = None;
+                        st.duck_next_spawn = None;
+                        if st.duck_score > 0 {
+                            msg = Some(format!("Final score: {}", st.duck_score));
+                        }
+                        st.duck_score = 0;
                     } else {
+                        st.duck_score = 0;
                         let screen_w = st.img.width() as f64 / st.scale;
                         let screen_h = st.img.height() as f64 / st.scale;
                         st.duck = Some(spawn_duck(screen_w, screen_h));
                     }
                     drop(st);
+                    if let Some(msg) = msg {
+                        flash_status(&msg);
+                    }
                     area.queue_draw();
                     glib::Propagation::Stop
                 }
