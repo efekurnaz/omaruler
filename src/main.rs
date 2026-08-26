@@ -174,19 +174,24 @@ fn update_duck(duck: &mut Duck, screen_w: f64, screen_h: f64) {
     duck.pos.0 += duck.vel.0 * dt;
     duck.pos.1 += duck.vel.1 * dt;
 
+    // Reflect the overshoot back into bounds instead of clamping straight
+    // to the margin — clamping discards however far it actually traveled
+    // past the edge that frame, which reads as a little snap/teleport back
+    // toward the middle right as it turns. Mirroring the overshoot keeps
+    // the distance traveled continuous, so it reads as a turn, not a jump.
     let margin = DUCK_HIT_RADIUS;
     if duck.pos.0 < margin {
-        duck.pos.0 = margin;
+        duck.pos.0 = margin + (margin - duck.pos.0);
         duck.vel.0 = duck.vel.0.abs();
     } else if duck.pos.0 > screen_w - margin {
-        duck.pos.0 = screen_w - margin;
+        duck.pos.0 = (screen_w - margin) - (duck.pos.0 - (screen_w - margin));
         duck.vel.0 = -duck.vel.0.abs();
     }
     if duck.pos.1 < margin {
-        duck.pos.1 = margin;
+        duck.pos.1 = margin + (margin - duck.pos.1);
         duck.vel.1 = duck.vel.1.abs();
     } else if duck.pos.1 > screen_h - margin {
-        duck.pos.1 = screen_h - margin;
+        duck.pos.1 = (screen_h - margin) - (duck.pos.1 - (screen_h - margin));
         duck.vel.1 = -duck.vel.1.abs();
     }
 
