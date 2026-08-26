@@ -295,6 +295,33 @@ fn draw_aim_circle(cr: &Context, theme: &Theme, cx: f64, cy: f64) {
     let _ = cr.stroke();
 }
 
+/// A prominent centered prompt — used for the duck easter egg's "click to
+/// continue" gate after a miss, so the round being paused is unmistakable
+/// rather than an easy-to-miss corner message.
+fn draw_center_prompt(cr: &Context, theme: &Theme, screen_w: i32, screen_h: i32, text: &str) {
+    let size = 16.0;
+    let (tw, th) = measure_text_sized(cr, text, size);
+    let pad = 14.0;
+    let box_w = tw + pad * 2.0;
+    let box_h = th + pad * 2.0;
+    let x = (screen_w as f64 - box_w) / 2.0;
+    let y = (screen_h as f64 - box_h) / 2.0;
+
+    let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
+    cr.set_source_rgba(bg.0, bg.1, bg.2, 0.92);
+    cr.rectangle(x, y, box_w, box_h);
+    let _ = cr.fill();
+    cr.set_source_rgba(ac.0, ac.1, ac.2, 0.8);
+    cr.set_line_width(1.5);
+    cr.rectangle(x, y, box_w, box_h);
+    let _ = cr.stroke();
+
+    select_font_sized(cr, size);
+    cr.set_source_rgba(fg.0, fg.1, fg.2, 1.0);
+    cr.move_to(x + pad, y + pad + th);
+    let _ = cr.show_text(text);
+}
+
 struct State {
     img: RgbaImage,
     grad: Vec<f32>,
@@ -336,11 +363,16 @@ struct State {
     last_message: Option<String>,
     /// Easter egg (`d`) — see `Duck`/`spawn_duck`/`update_duck`/`draw_duck`.
     duck: Option<Duck>,
-    /// `Some(deadline)` between one duck being gone and the next spawning —
+    /// `Some(deadline)` right after a kill, before the next duck spawns —
     /// distinct from `duck.is_none()` at rest (game off) so the tick
     /// callback and the `d`/Escape/`r` handlers can tell "mid-round,
     /// waiting to respawn" apart from "not playing".
     duck_next_spawn: Option<std::time::Instant>,
+    /// Set when a duck escapes (flies off or outruns the clock) instead of
+    /// an auto-respawn timer — the round pauses on a centered "click to
+    /// continue" prompt until the next click, rather than silently handing
+    /// you a fresh duck.
+    duck_waiting_continue: bool,
     duck_score: u32,
     duck_high_score: u32,
     sounds: Sounds,
@@ -1693,6 +1725,10 @@ fn draw(cr: &Context, w: i32, h: i32, st: &State) -> Option<Rect> {
         draw_aim_circle(cr, &st.theme, cx, cy);
     }
 
+    if st.duck_waiting_continue {
+        draw_center_prompt(cr, &st.theme, w, h, "Click to continue");
+    }
+
     if let Some(msg) = &st.last_message {
         draw_label(cr, 16.0, h as f64 - 64.0, msg, &st.theme);
     }
@@ -1789,6 +1825,7 @@ fn build_ui(app: &Application) {
         last_message: None,
         duck: None,
         duck_next_spawn: None,
+        duck_waiting_continue: false,
         duck_score: 0,
         duck_high_score: load_high_score(),
         sounds: load_sounds(),
@@ -1889,7 +1926,7 @@ fn build_ui(app: &Application) {
                 });
                 if escaped {
                     st.duck = None;
-                    st.duck_next_spawn = Some(now + DUCK_RESPAWN_DELAY);
+                    st.duck_waiting_continue = true;
                     miss_message = Some(format!("The duck got away! Final score: {}", st.duck_score));
                     fail_path = Some(st.sounds.fail.clone());
                     st.duck_score = 0;
@@ -1921,6 +1958,17 @@ fn build_ui(app: &Application) {
         let window = window.clone();
         click.connect_pressed(move |_g, _n, _x, _y| {
             let mut st = state.borrow_mut();
+            if st.duck_waiting_continue {
+                st.duck_waiting_continue = false;
+                let screen_w = st.img.width() as f64 / st.scale;
+                let screen_h = st.img.height() as f64 / st.scale;
+                st.duck = Some(spawn_duck(screen_w, screen_h));
+                let chime_path = st.sounds.chime.clone();
+                drop(st);
+                play_sound(&chime_path);
+                area.queue_draw();
+                return;
+            }
             if st.duck.is_some() {
                 // The trigger fires whether or not the shot connects.
                 let shot_path = st.sounds.shot.clone();
@@ -2046,6 +2094,7 @@ fn build_ui(app: &Application) {
                     }
                     let has_anything = st.duck.is_some()
                         || st.duck_next_spawn.is_some()
+                        || st.duck_waiting_continue
                         || (st.mode == Mode::Ruler
                             && (st.dragging
                                 || !st.snapped_rects.is_empty()
@@ -2064,6 +2113,7 @@ fn build_ui(app: &Application) {
                         st.undo_stack.clear();
                         st.duck = None;
                         st.duck_next_spawn = None;
+                        st.duck_waiting_continue = false;
                         st.duck_score = 0;
                         sync_cursor_visibility(&window, &st);
                         refresh_legend(&st);
@@ -2122,6 +2172,7 @@ fn build_ui(app: &Application) {
                     st.undo_stack.clear();
                     st.duck = None;
                     st.duck_next_spawn = None;
+                    st.duck_waiting_continue = false;
                     st.duck_score = 0;
                     sync_cursor_visibility(&window, &st);
                     refresh_legend(&st);
@@ -2187,12 +2238,13 @@ fn build_ui(app: &Application) {
                 // Easter egg — deliberately not in the legend.
                 gdk::Key::d | gdk::Key::D => {
                     let mut st = state.borrow_mut();
-                    let playing = st.duck.is_some() || st.duck_next_spawn.is_some();
+                    let playing = st.duck.is_some() || st.duck_next_spawn.is_some() || st.duck_waiting_continue;
                     let mut msg = None;
                     let mut chime = false;
                     if playing {
                         st.duck = None;
                         st.duck_next_spawn = None;
+                        st.duck_waiting_continue = false;
                         if st.duck_score > 0 {
                             msg = Some(format!("Final score: {}", st.duck_score));
                         }
