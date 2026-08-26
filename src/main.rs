@@ -98,6 +98,39 @@ impl Rng {
     }
 }
 
+/// Small procedurally-synthesized sound effects for the duck easter egg
+/// (see `assets/sounds/`), embedded directly in the binary so this stays a
+/// single self-contained executable — no asset files to ship or fetch
+/// alongside it. Written out to temp files once at startup and played via
+/// `paplay`, the standard PulseAudio/PipeWire client already present on
+/// stock Omarchy, rather than pulling in an audio-playback crate for four
+/// short clips.
+struct Sounds {
+    shot: std::path::PathBuf,
+    quack: std::path::PathBuf,
+    fail: std::path::PathBuf,
+    chime: std::path::PathBuf,
+}
+
+fn write_sound_asset(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("{}-sound-{}.wav", APP_NAME, name));
+    let _ = std::fs::write(&path, bytes);
+    path
+}
+
+fn load_sounds() -> Sounds {
+    Sounds {
+        shot: write_sound_asset("shot", include_bytes!("../assets/sounds/shot.wav")),
+        quack: write_sound_asset("quack", include_bytes!("../assets/sounds/quack.wav")),
+        fail: write_sound_asset("fail", include_bytes!("../assets/sounds/fail.wav")),
+        chime: write_sound_asset("chime", include_bytes!("../assets/sounds/chime.wav")),
+    }
+}
+
+fn play_sound(path: &std::path::Path) {
+    let _ = Command::new("paplay").arg(path).spawn();
+}
+
 /// Easter egg: press `d` to spawn one, click it to kill it. Flies with an
 /// erratic Duck Hunt-style path (constant speed, occasional random turns,
 /// bounces off screen edges) and flies off on its own if you're too slow.
@@ -314,6 +347,7 @@ struct State {
     duck_next_spawn: Option<std::time::Instant>,
     duck_score: u32,
     duck_high_score: u32,
+    sounds: Sounds,
 }
 
 fn rgba_at(img: &RgbaImage, x: u32, y: u32) -> (u8, u8, u8, u8) {
@@ -1761,6 +1795,7 @@ fn build_ui(app: &Application) {
         duck_next_spawn: None,
         duck_score: 0,
         duck_high_score: load_high_score(),
+        sounds: load_sounds(),
     }));
 
     let picture = Picture::for_paintable(&texture);
@@ -1847,18 +1882,23 @@ fn build_ui(app: &Application) {
                 }
 
                 let mut miss_message = None;
+                let mut fail_path = None;
                 let screen_w = st.img.width() as f64 / st.scale;
                 let screen_h = st.img.height() as f64 / st.scale;
                 if st.duck.as_ref().is_some_and(|d| d.spawned.elapsed() >= DUCK_LIFETIME) {
                     st.duck = None;
                     st.duck_next_spawn = Some(now + DUCK_RESPAWN_DELAY);
                     miss_message = Some(format!("The duck got away! Score: {}", st.duck_score));
+                    fail_path = Some(st.sounds.fail.clone());
                 } else if let Some(duck) = st.duck.as_mut() {
                     update_duck(duck, screen_w, screen_h);
                 }
 
                 let should_redraw = st.duck.is_some() || st.duck_next_spawn.is_some() || miss_message.is_some();
                 drop(st);
+                if let Some(path) = fail_path {
+                    play_sound(&path);
+                }
                 if let Some(msg) = miss_message {
                     flash_status(&msg);
                 }
@@ -1878,6 +1918,11 @@ fn build_ui(app: &Application) {
         let window = window.clone();
         click.connect_pressed(move |_g, _n, _x, _y| {
             let mut st = state.borrow_mut();
+            if st.duck.is_some() {
+                // The trigger fires whether or not the shot connects.
+                let shot_path = st.sounds.shot.clone();
+                play_sound(&shot_path);
+            }
             if st.duck.as_ref().is_some_and(|d| duck_hit(d, st.cursor)) {
                 st.duck = None;
                 st.duck_next_spawn = Some(std::time::Instant::now() + DUCK_RESPAWN_DELAY);
@@ -1889,7 +1934,9 @@ fn build_ui(app: &Application) {
                 } else {
                     format!("🦆 Quack! Score: {}", st.duck_score)
                 };
+                let quack_path = st.sounds.quack.clone();
                 drop(st);
+                play_sound(&quack_path);
                 flash_status(&msg);
                 area.queue_draw();
                 return;
@@ -2139,6 +2186,7 @@ fn build_ui(app: &Application) {
                     let mut st = state.borrow_mut();
                     let playing = st.duck.is_some() || st.duck_next_spawn.is_some();
                     let mut msg = None;
+                    let mut chime = false;
                     if playing {
                         st.duck = None;
                         st.duck_next_spawn = None;
@@ -2151,8 +2199,13 @@ fn build_ui(app: &Application) {
                         let screen_w = st.img.width() as f64 / st.scale;
                         let screen_h = st.img.height() as f64 / st.scale;
                         st.duck = Some(spawn_duck(screen_w, screen_h));
+                        chime = true;
                     }
+                    let chime_path = st.sounds.chime.clone();
                     drop(st);
+                    if chime {
+                        play_sound(&chime_path);
+                    }
                     if let Some(msg) = msg {
                         flash_status(&msg);
                     }
