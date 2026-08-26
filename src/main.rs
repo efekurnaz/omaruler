@@ -562,6 +562,7 @@ const LEGEND_IDLE: &[(&str, &str)] = &[
     ("shift+h/v", "guide"),
     ("ctrl+z", "undo"),
     ("t", "tolerance"),
+    ("n", "toggle snap"),
     ("c", "color"),
     ("l", "hide legend"),
 ];
@@ -575,6 +576,7 @@ const LEGEND_SELECTION: &[(&str, &str)] = &[
     ("s", "save"),
     ("ctrl+z", "undo"),
     ("t", "tolerance"),
+    ("n", "toggle snap"),
     ("l", "hide legend"),
 ];
 
@@ -2063,8 +2065,12 @@ fn build_ui(app: &Application) {
                             (r * scale).round() as i64,
                             (b * scale).round() as i64,
                         );
-                        let tol = TOLERANCE_LEVELS[st.tolerance_level].0;
-                        let (nl, nt, nr, nb) = shrink_rect(&st.img, prect, tol);
+                        let (nl, nt, nr, nb) = if st.snap_enabled {
+                            let tol = TOLERANCE_LEVELS[st.tolerance_level].0;
+                            shrink_rect(&st.img, prect, tol)
+                        } else {
+                            prect
+                        };
                         st.snapped_rects.push((nl as f64 / scale, nt as f64 / scale, nr as f64 / scale, nb as f64 / scale));
                         st.undo_stack.push(UndoItem::Rect);
                         refresh_legend(&st);
@@ -2152,16 +2158,20 @@ fn build_ui(app: &Application) {
                     glib::Propagation::Stop
                 }
                 gdk::Key::s | gdk::Key::S => {
-                    let mut st = state.borrow_mut();
+                    let st = state.borrow();
                     if st.mode == Mode::Ruler && !st.snapped_rects.is_empty() {
                         if let Some(&rect) = st.snapped_rects.last() {
                             save_selection_direct(&st, rect);
                         }
-                        drop(st);
-                        return glib::Propagation::Stop;
                     }
+                    glib::Propagation::Stop
+                }
+                gdk::Key::n | gdk::Key::N => {
+                    let mut st = state.borrow_mut();
                     st.snap_enabled = !st.snap_enabled;
+                    let msg = if st.snap_enabled { "Snap: On" } else { "Snap: Off" };
                     drop(st);
+                    flash_status(msg);
                     area.queue_draw();
                     glib::Propagation::Stop
                 }

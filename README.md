@@ -69,6 +69,8 @@ GIMP's Autocrop. A loose box around an object on a plain background ends up
 snapped tight to the object. The live crosshair stays active while a
 rectangle is snapped, so you can keep dragging out more rectangles to compare
 several elements at once — each one keeps its own snap-to-content result.
+This shrink-to-fit trim can be turned off (`n`) if you want the rectangle
+exactly as dragged.
 
 **Hover the last snapped box**: hovering its size readout swaps it to a
 camera icon — click to open the crop in `omasnap`'s editor. With a selection
@@ -122,7 +124,8 @@ close.
 | Hold Shift | Full-screen alignment crosshair (no measurement) |
 | Arrow keys | Nudge cursor 1px (hold Shift for 10px) |
 | `c` | Copy the active selection, or toggle color-picker mode if none |
-| `s` | Save the active selection to disk, or toggle cursor edge-snapping if none |
+| `s` | Save the active selection to disk |
+| `n` | Toggle snap: cursor magnet-snap to edges, and shrink-to-fit on dragged rectangles |
 | Click (color mode) | Copy the hex color under the cursor |
 | `t` | Cycle color tolerance: off / low / med / high |
 | `-` / `=` | Step color tolerance down / up |
