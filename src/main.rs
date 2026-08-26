@@ -1927,7 +1927,12 @@ fn build_ui(app: &Application) {
                 if escaped {
                     st.duck = None;
                     st.duck_waiting_continue = true;
-                    miss_message = Some(format!("The duck got away! Final score: {}", st.duck_score));
+                    // omarchy-osd elides non-media messages past ~22
+                    // characters (Osd.qml's maxMessageWidth) — confirmed
+                    // "The duck got away! Final score: N" was truncating to
+                    // "The duck got away! Fi…" in practice, so this stays
+                    // short rather than descriptive.
+                    miss_message = Some(format!("Missed! Score: {}", st.duck_score));
                     fail_path = Some(st.sounds.fail.clone());
                     st.duck_score = 0;
                 } else if let Some(duck) = st.duck.as_mut() {
@@ -1981,7 +1986,8 @@ fn build_ui(app: &Application) {
                 let msg = if st.duck_score > st.duck_high_score {
                     st.duck_high_score = st.duck_score;
                     save_high_score(st.duck_high_score);
-                    format!("🦆 New high score: {}!", st.duck_score)
+                    // Same OSD width limit as the miss message above.
+                    format!("🦆 High score: {}!", st.duck_score)
                 } else {
                     format!("🦆 Quack! Score: {}", st.duck_score)
                 };
