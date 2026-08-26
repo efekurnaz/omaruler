@@ -132,8 +132,9 @@ fn play_sound(path: &std::path::Path) {
 }
 
 /// Easter egg: press `d` to spawn one, click it to kill it. Flies with an
-/// erratic Duck Hunt-style path (constant speed, occasional random turns,
-/// bounces off screen edges) and flies off on its own if you're too slow.
+/// erratic Duck Hunt-style path (constant speed, occasional random turns)
+/// and is lost for good — no bounce — if it reaches an edge or outruns the
+/// clock before you do.
 struct Duck {
     pos: (f64, f64),
     vel: (f64, f64),
@@ -199,7 +200,12 @@ fn spawn_duck(screen_w: f64, screen_h: f64) -> Duck {
 /// clock can't fling the duck across the screen in one jump), bounces it
 /// off the screen edges, and occasionally injects a random turn — the
 /// erratic part of the flight path.
-fn update_duck(duck: &mut Duck, screen_w: f64, screen_h: f64) {
+/// No edge bounce — a duck that reaches the screen boundary just keeps
+/// going and is lost for good (see `duck_offscreen`), same as the real
+/// game. That's what makes it a threat instead of a target you can take
+/// your time lining up: it flies away permanently if you don't catch it
+/// first.
+fn update_duck(duck: &mut Duck) {
     let now = std::time::Instant::now();
     let dt = now.duration_since(duck.last_update).as_secs_f64().min(0.05);
     duck.last_update = now;
@@ -207,33 +213,23 @@ fn update_duck(duck: &mut Duck, screen_w: f64, screen_h: f64) {
     duck.pos.0 += duck.vel.0 * dt;
     duck.pos.1 += duck.vel.1 * dt;
 
-    // Reflect the overshoot back into bounds instead of clamping straight
-    // to the margin — clamping discards however far it actually traveled
-    // past the edge that frame, which reads as a little snap/teleport back
-    // toward the middle right as it turns. Mirroring the overshoot keeps
-    // the distance traveled continuous, so it reads as a turn, not a jump.
-    let margin = DUCK_HIT_RADIUS;
-    if duck.pos.0 < margin {
-        duck.pos.0 = margin + (margin - duck.pos.0);
-        duck.vel.0 = duck.vel.0.abs();
-    } else if duck.pos.0 > screen_w - margin {
-        duck.pos.0 = (screen_w - margin) - (duck.pos.0 - (screen_w - margin));
-        duck.vel.0 = -duck.vel.0.abs();
-    }
-    if duck.pos.1 < margin {
-        duck.pos.1 = margin + (margin - duck.pos.1);
-        duck.vel.1 = duck.vel.1.abs();
-    } else if duck.pos.1 > screen_h - margin {
-        duck.pos.1 = (screen_h - margin) - (duck.pos.1 - (screen_h - margin));
-        duck.vel.1 = -duck.vel.1.abs();
-    }
-
     if now >= duck.next_turn {
         let speed = (duck.vel.0 * duck.vel.0 + duck.vel.1 * duck.vel.1).sqrt();
         let angle = duck.vel.1.atan2(duck.vel.0) + duck.rng.range(-1.2, 1.2);
         duck.vel = (speed * angle.cos(), speed * angle.sin());
         duck.next_turn = now + std::time::Duration::from_millis(duck.rng.range(500.0, 1400.0) as u64);
     }
+}
+
+/// True once the duck has fully left the visible screen (not just touched
+/// the edge) — it's allowed to fly a bit past the boundary first so it
+/// visibly exits the frame rather than vanishing right at the edge.
+fn duck_offscreen(duck: &Duck, screen_w: f64, screen_h: f64) -> bool {
+    const OFFSCREEN_MARGIN: f64 = 60.0;
+    duck.pos.0 < -OFFSCREEN_MARGIN
+        || duck.pos.0 > screen_w + OFFSCREEN_MARGIN
+        || duck.pos.1 < -OFFSCREEN_MARGIN
+        || duck.pos.1 > screen_h + OFFSCREEN_MARGIN
 }
 
 fn duck_hit(duck: &Duck, point: (f64, f64)) -> bool {
@@ -1885,13 +1881,20 @@ fn build_ui(app: &Application) {
                 let mut fail_path = None;
                 let screen_w = st.img.width() as f64 / st.scale;
                 let screen_h = st.img.height() as f64 / st.scale;
-                if st.duck.as_ref().is_some_and(|d| d.spawned.elapsed() >= DUCK_LIFETIME) {
+                // A duck is lost for good either by outrunning the 15s
+                // clock or by reaching an edge and flying off — no bounce,
+                // so a miss costs the whole run, not just that one duck.
+                let escaped = st.duck.as_ref().is_some_and(|d| {
+                    d.spawned.elapsed() >= DUCK_LIFETIME || duck_offscreen(d, screen_w, screen_h)
+                });
+                if escaped {
                     st.duck = None;
                     st.duck_next_spawn = Some(now + DUCK_RESPAWN_DELAY);
-                    miss_message = Some(format!("The duck got away! Score: {}", st.duck_score));
+                    miss_message = Some(format!("The duck got away! Final score: {}", st.duck_score));
                     fail_path = Some(st.sounds.fail.clone());
+                    st.duck_score = 0;
                 } else if let Some(duck) = st.duck.as_mut() {
-                    update_duck(duck, screen_w, screen_h);
+                    update_duck(duck);
                 }
 
                 let should_redraw = st.duck.is_some() || st.duck_next_spawn.is_some() || miss_message.is_some();
