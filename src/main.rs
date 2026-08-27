@@ -2416,3 +2416,176 @@ fn main() -> glib::ExitCode {
     app.connect_activate(build_ui);
     app.run()
 }
+
+/// Fast, deterministic checks for this app's pure-logic core — the
+/// color/geometry math and hand-rolled parsers that are easy to get subtly
+/// wrong and don't need a live compositor to verify. Mirrors the spirit of
+/// omasnap's own smoke suite (small, focused checks over format/geometry
+/// logic, run headless) rather than trying to drive the actual GTK/
+/// layer-shell surface, which needs a real Wayland compositor — that side
+/// stays manually verified (screenshot/behavioral checks against a live
+/// Hyprland session, as this project's commit history already does).
+#[cfg(test)]
+mod smoke {
+    use super::*;
+
+    fn solid_image(w: u32, h: u32, rgb: (u8, u8, u8)) -> RgbaImage {
+        RgbaImage::from_pixel(w, h, image::Rgba([rgb.0, rgb.1, rgb.2, 255]))
+    }
+
+    #[test]
+    fn parse_hex_color_accepts_with_or_without_hash() {
+        assert_eq!(parse_hex_color("#ff8800"), Some((1.0, 0x88 as f64 / 255.0, 0.0)));
+        assert_eq!(parse_hex_color("ff8800"), parse_hex_color("#ff8800"));
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_short_or_invalid() {
+        assert_eq!(parse_hex_color("#fff"), None);
+        assert_eq!(parse_hex_color("#zzzzzz"), None);
+        assert_eq!(parse_hex_color(""), None);
+    }
+
+    #[test]
+    fn color_close_respects_tolerance_per_channel() {
+        let img = solid_image(2, 1, (100, 100, 100));
+        assert!(color_close(&img, 0, 0, 2, 1, (100, 100, 100), 0));
+        assert!(color_close(&img, 0, 0, 2, 1, (105, 95, 100), 5));
+        assert!(!color_close(&img, 0, 0, 2, 1, (106, 100, 100), 5));
+    }
+
+    #[test]
+    fn color_close_rejects_out_of_bounds() {
+        let img = solid_image(2, 2, (0, 0, 0));
+        assert!(!color_close(&img, -1, 0, 2, 2, (0, 0, 0), 255));
+        assert!(!color_close(&img, 2, 0, 2, 2, (0, 0, 0), 255));
+    }
+
+    #[test]
+    fn best_ratio_finds_exact_16_9() {
+        let (a, b, exact) = best_ratio(1920.0, 1080.0).expect("16:9 should be found");
+        assert_eq!((a, b), (16, 9));
+        assert!(exact);
+    }
+
+    #[test]
+    fn best_ratio_hides_when_nothing_close_fits() {
+        assert_eq!(best_ratio(500.0, 7.0), None);
+    }
+
+    #[test]
+    fn best_ratio_rejects_non_positive_input() {
+        assert_eq!(best_ratio(0.0, 10.0), None);
+        assert_eq!(best_ratio(10.0, -1.0), None);
+    }
+
+    #[test]
+    fn rects_overlap_detects_intersection_and_touching_edges() {
+        assert!(rects_overlap((0.0, 0.0, 10.0, 10.0), (5.0, 5.0, 15.0, 15.0)));
+        assert!(!rects_overlap((0.0, 0.0, 10.0, 10.0), (10.0, 10.0, 20.0, 20.0)));
+        assert!(!rects_overlap((0.0, 0.0, 10.0, 10.0), (20.0, 20.0, 30.0, 30.0)));
+    }
+
+    #[test]
+    fn duck_hit_uses_the_forgiving_aim_radius_not_just_the_body() {
+        let duck = Duck {
+            pos: (100.0, 100.0),
+            vel: (1.0, 0.0),
+            rng: Rng::new(1),
+            spawned: std::time::Instant::now(),
+            last_update: std::time::Instant::now(),
+            next_turn: std::time::Instant::now(),
+        };
+        // Dead center: always a hit.
+        assert!(duck_hit(&duck, (100.0, 100.0)));
+        // Well outside the duck's own body (22px) but inside the combined
+        // body+aim radius (48px) — this is the whole point of the aim
+        // circle: nearby counts, not just a pixel-perfect click.
+        assert!(duck_hit(&duck, (140.0, 100.0)));
+        // Comfortably outside even the forgiving radius.
+        assert!(!duck_hit(&duck, (160.0, 100.0)));
+    }
+
+    #[test]
+    fn decode_ppm_parses_a_minimal_header_and_pixels() {
+        // 2x1: one red pixel, one green pixel.
+        let ppm = b"P6\n2 1\n255\n\xff\x00\x00\x00\xff\x00";
+        let img = decode_ppm(ppm).expect("valid PPM should decode");
+        assert_eq!(img.dimensions(), (2, 1));
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn decode_ppm_skips_a_comment_line_in_the_header() {
+        let ppm = b"P6\n# a comment\n1 1\n255\n\x01\x02\x03";
+        let img = decode_ppm(ppm).expect("comment before dimensions should be skipped");
+        assert_eq!(img.get_pixel(0, 0).0, [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn decode_ppm_rejects_wrong_magic_or_maxval() {
+        assert!(decode_ppm(b"P5\n1 1\n255\n\x00").is_none());
+        assert!(decode_ppm(b"P6\n1 1\n15\n\x00\x00\x00").is_none());
+    }
+
+    #[test]
+    fn decode_ppm_rejects_truncated_pixel_data() {
+        // Header claims 2x1 but only one pixel's worth of bytes follows.
+        assert!(decode_ppm(b"P6\n2 1\n255\n\x00\x00\x00").is_none());
+    }
+
+    #[test]
+    fn command_exists_finds_a_real_binary_and_rejects_nonsense() {
+        assert!(command_exists("sh"));
+        assert!(!command_exists("definitely-not-a-real-command-xyz"));
+    }
+
+    #[test]
+    fn scan_extent_stops_at_a_color_change() {
+        // 10x1: columns 0..=4 white, 5..=9 black.
+        let mut img = RgbaImage::from_pixel(10, 1, image::Rgba([255, 255, 255, 255]));
+        for x in 5..10 {
+            img.put_pixel(x, 0, image::Rgba([0, 0, 0, 255]));
+        }
+        let (left, right, top, bottom) = scan_extent(&img, 2, 0, 0, &[], &[]);
+        assert_eq!((left, right, top, bottom), (0, 4, 0, 0));
+    }
+
+    #[test]
+    fn scan_extent_stops_exactly_at_a_guide_even_without_a_color_change() {
+        // Uniform 10x1 white row — without a guide the scan would reach
+        // both image edges. A guide at x=3 must clamp it there exactly, not
+        // one pixel short (regression check: this was an off-by-one bug).
+        let img = RgbaImage::from_pixel(10, 1, image::Rgba([255, 255, 255, 255]));
+        let (left, right, _, _) = scan_extent(&img, 5, 0, 0, &[3], &[]);
+        assert_eq!(left, 3);
+        assert_eq!(right, 9);
+    }
+
+    #[test]
+    fn shrink_rect_trims_to_content_without_cutting_into_it() {
+        // 10x10 white canvas with a 2x2 black square at (4,4)-(5,5).
+        let mut img = RgbaImage::from_pixel(10, 10, image::Rgba([255, 255, 255, 255]));
+        for y in 4..=5 {
+            for x in 4..=5 {
+                img.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+            }
+        }
+        let (l, t, r, b) = shrink_rect(&img, (0, 0, 9, 9), 0);
+        // Never trims into the object...
+        assert!(l <= 4 && t <= 4 && r >= 5 && b >= 5, "trimmed box {:?} cuts into the content", (l, t, r, b));
+        // ...but does meaningfully shrink from the full canvas.
+        assert!(r - l < 9 && b - t < 9, "box didn't shrink at all: {:?}", (l, t, r, b));
+    }
+
+    #[test]
+    fn shrink_rect_collapses_toward_center_with_no_content_to_find() {
+        // A uniform image has nothing to distinguish an edge from, so the
+        // trim should run all the way in until the center-crossing safety
+        // cap stops it — not stay at the original full-canvas size.
+        let img = solid_image(10, 10, (10, 20, 30));
+        let (l, t, r, b) = shrink_rect(&img, (0, 0, 9, 9), 0);
+        assert!(r - l <= 2 && b - t <= 2, "expected a near-center collapse, got {:?}", (l, t, r, b));
+    }
+}
