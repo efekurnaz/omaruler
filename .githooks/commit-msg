@@ -1,0 +1,14 @@
+#!/bin/sh
+# Enforces Conventional Commits (committed.toml) on every commit message.
+# Activate once per clone: git config core.hooksPath .githooks
+#
+# Degrades gracefully if `committed` isn't installed — warns instead of
+# blocking, so a missing tool never locks anyone out of committing.
+
+if ! command -v committed >/dev/null 2>&1; then
+  echo "commit-msg: 'committed' not found, skipping commit message lint" >&2
+  echo "commit-msg: install it (pacman -S committed / cargo install committed) to enforce Conventional Commits locally" >&2
+  exit 0
+fi
+
+committed --commit-file "$1"

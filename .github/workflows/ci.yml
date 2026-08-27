@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    # Omaruler only ever runs on Arch/Omarchy — building and testing inside
+    # an Arch container is both simpler and more representative than an
+    # Ubuntu runner (gtk4-layer-shell's GTK4 build isn't packaged for
+    # Ubuntu until 25.04+; it's a plain `extra` package on Arch).
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm base-devel gtk4 gtk4-layer-shell rust git
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --release --locked

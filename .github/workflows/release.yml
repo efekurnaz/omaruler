@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    permissions:
+      contents: write
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm base-devel gtk4 gtk4-layer-shell rust git git-cliff
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history — git-cliff needs it to build the changelog
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Generate release notes for this tag
+        run: git-cliff --current --strip header -o RELEASE_NOTES.md
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: target/release/omaruler

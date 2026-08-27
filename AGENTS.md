@@ -43,6 +43,35 @@ job, and exits — no background daemon, no continuous screen capture.
 | `assets/sounds/synth_sounds.py` | Regenerates the WAV files above — pure-Python sine/sawtooth/noise synthesis, no sample library |
 | `README.md` | User-facing features, controls, build/install instructions |
 | `Cargo.toml` | Dependencies and the release build profile |
+| `committed.toml` | Conventional Commits rules enforced by `.githooks/commit-msg` |
+| `cliff.toml` | `git-cliff` changelog config, driven by the same Conventional Commits history |
+| `.github/workflows/ci.yml` | Build + `cargo test` on every push/PR, inside an Arch container |
+| `.github/workflows/release.yml` | Builds and publishes a GitHub Release (binary + changelog) on every `vX.Y.Z` tag push |
+
+## Commit messages
+
+Every commit must follow [Conventional Commits](https://www.conventionalcommits.org/):
+`type: Subject` (or `type(scope): Subject`), imperative mood, capitalized
+subject, ≤100 characters, type one of `feat fix chore docs style refactor
+perf test ci build revert` (see `committed.toml`). This isn't just a style
+preference — `git-cliff` groups the changelog by these types, so a
+commit that doesn't follow the convention doesn't show up in a release's
+notes at all.
+
+Activate the enforcing hook once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+It runs [`committed`](https://github.com/crate-ci/committed) (`pacman -S
+committed` / `cargo install committed`) against every commit message and
+rejects ones that don't conform; it degrades to a warning (doesn't block)
+if `committed` isn't installed. Check a message by hand with:
+
+```bash
+committed --commit-file - <<< "feat: Add a thing"
+```
 
 ## Build and verify
 
@@ -75,9 +104,23 @@ done.
 ## Release process
 
 Not yet packaged or distributed via any package manager — built from
-source (`cargo build --release`) and run directly. If/when a release
-process is needed: bump `version` in `Cargo.toml`, run `cargo test`,
-commit, tag `v<version>`, push.
+source (`cargo build --release`) and run directly.
+
+1. Bump `version` in `Cargo.toml` (`Cargo.lock` updates with the next
+   `cargo build`). Follow [SemVer](https://semver.org/): breaking change →
+   major, new feature → minor, fix/internal-only → patch.
+2. `cargo test`.
+3. Commit (`chore: Bump version to X.Y.Z`), tag `vX.Y.Z`, push both
+   (`git push && git push --tags`).
+4. The `Release` GitHub Actions workflow takes it from there: builds the
+   release binary and publishes a GitHub Release with `git-cliff`-generated
+   notes (grouped by commit type — Features, Bug Fixes, etc.) and the
+   binary attached. Nothing to do by hand beyond pushing the tag.
+
+Since the changelog is generated from commit history, only commits that
+actually follow Conventional Commits (see above) show up in a release's
+notes — this is the concrete payoff of enforcing the format, not just
+tidiness.
 
 See `README.md` for user-facing features, keybindings, and build
 instructions — keep it in sync when behavior changes.

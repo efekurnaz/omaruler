@@ -1,0 +1,19 @@
+# Enforces Conventional Commits (https://www.conventionalcommits.org) via the
+# `committed` commit-msg hook — see .githooks/commit-msg and AGENTS.md.
+style = "conventional"
+# commitlint's own default (@commitlint/config-conventional) — generous
+# enough for a descriptive subject, still a real limit.
+subject_length = 100
+allowed_types = [
+    "feat",
+    "fix",
+    "chore",
+    "docs",
+    "style",
+    "refactor",
+    "perf",
+    "test",
+    "ci",
+    "build",
+    "revert",
+]
