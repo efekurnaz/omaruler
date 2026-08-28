@@ -1,0 +1,50 @@
+# Maintainer: Efe Can KURNAZ <efekurnaz@gmail.com>
+
+pkgname=omaruler-git
+pkgver=r30.f6fc42b
+pkgrel=1
+pkgdesc="PixelSnap-style measuring ruler and color picker overlay for Omarchy/Hyprland"
+arch=('x86_64')
+url="https://github.com/efekurnaz/omaruler"
+license=('MIT')
+# hyprctl / grim / wl-copy are called at runtime; omarchy-theme-color and
+# omarchy-osd are expected on PATH (they ship with Omarchy, which is not a
+# package). omarchy-legend is optional - omaruler draws the hint card itself
+# when it is missing.
+depends=('gtk4' 'gtk4-layer-shell' 'grim' 'wl-clipboard' 'hyprland')
+makedepends=('cargo' 'git')
+optdepends=('libpulse: sound effects for the hidden easter egg')
+provides=('omaruler')
+conflicts=('omaruler')
+source=("git+https://github.com/efekurnaz/omaruler.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/omaruler"
+  printf 'r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$srcdir/omaruler"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$srcdir/omaruler"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$srcdir/omaruler"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$srcdir/omaruler"
+  install -Dm0755 target/release/omaruler "$pkgdir/usr/bin/omaruler"
+  install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
