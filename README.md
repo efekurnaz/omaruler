@@ -46,8 +46,9 @@ save that selection as an image, or pick a color.
   `omarchy-legend` is checked for on `$PATH` once at startup; if it isn't
   there yet (this app may well land before that shell service does), the
   exact same hint entries are drawn locally in Cairo instead — same
-  content, just without the shell's theming/hover-flip. `omarchy-osd` has
-  no such fallback since it already ships on stock Omarchy today.
+  content and the same slide-out-of-the-cursor's-way behavior, just
+  without the shell's theming. `omarchy-osd` has no such fallback since it
+  already ships on stock Omarchy today.
 
 No continuous screen capture, no background daemon — it launches, does its
 job, and exits.

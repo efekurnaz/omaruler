@@ -1589,15 +1589,24 @@ fn draw_selection_rect(cr: &Context, st: &State, rect: Rect, interactive: bool, 
 /// Fallback for when `omarchy-legend` isn't installed (e.g. this app
 /// lands somewhere before the shell-side legend service does): the same
 /// entries `legend_entries` would otherwise hand to the shell, drawn
-/// locally as a plain two-column card in the top-right corner. No
-/// hover-flip-to-the-other-corner like the shell version does — just
-/// enough to not leave the hints missing entirely.
-fn draw_builtin_legend(cr: &Context, theme: &Theme, screen_w: i32, entries: &[(&str, &str)]) {
+/// locally as a plain two-column card. Sits in the top-right corner and,
+/// like the shell version, slides to the top-left when the cursor is over
+/// that slot and the left one is clear — the choice is made from both
+/// fixed slots, not the card's current spot, so it doesn't oscillate.
+fn draw_builtin_legend(
+    cr: &Context,
+    theme: &Theme,
+    screen_w: i32,
+    cursor: (f64, f64),
+    entries: &[(&str, &str)],
+) {
     select_font(cr);
     let pad = 14.0;
     let row_gap = 10.0;
     let col_gap = 24.0;
     let margin = 14.0;
+    // Flip a little before the cursor actually reaches the text.
+    let avoid = 20.0;
 
     let mut key_w = 0.0f64;
     let mut action_w = 0.0f64;
@@ -1613,8 +1622,17 @@ fn draw_builtin_legend(cr: &Context, theme: &Theme, screen_w: i32, entries: &[(&
     let content_h = entries.len() as f64 * row_h + entries.len().saturating_sub(1) as f64 * row_gap;
     let box_w = content_w + pad * 2.0;
     let box_h = content_h + pad * 2.0;
-    let x = screen_w as f64 - box_w - margin;
     let y = margin;
+    let right_x = screen_w as f64 - box_w - margin;
+    let left_x = margin;
+    let cursor_over = |slot_x: f64| {
+        let (cx, cy) = cursor;
+        cx >= slot_x - avoid
+            && cx <= slot_x + box_w + avoid
+            && cy >= y - avoid
+            && cy <= y + box_h + avoid
+    };
+    let x = if cursor_over(right_x) && !cursor_over(left_x) { left_x } else { right_x };
 
     let (bg, fg, ac) = (theme.background, theme.foreground, theme.accent);
     cr.set_source_rgba(bg.0, bg.1, bg.2, 0.97);
@@ -1737,7 +1755,7 @@ fn draw(cr: &Context, w: i32, h: i32, st: &State) -> Option<Rect> {
 
     if !st.legend_available {
         if let Some(entries) = legend_entries(st) {
-            draw_builtin_legend(cr, &st.theme, w, entries);
+            draw_builtin_legend(cr, &st.theme, w, st.cursor, entries);
         }
     }
 
