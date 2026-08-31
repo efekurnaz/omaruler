@@ -139,7 +139,20 @@ Tolerance changes and saved/copied screenshots are all flashed via
 `omarchy-osd` rather than a desktop notification, matching how the rest of
 the Omarchy shell surfaces transient state.
 
+## Install
+
+On Omarchy / Arch, from the AUR (see [`packaging/`](packaging/)):
+
+```sh
+omarchy-pkg-add omaruler-bin      # prebuilt binary, no toolchain — recommended
+omarchy-pkg-add omaruler-git      # or build the latest master from source
+```
+
+Both drop `omaruler` on `$PATH`; add the keybind below.
+
 ## Build
+
+To build it yourself instead:
 
 ```sh
 cargo build --release

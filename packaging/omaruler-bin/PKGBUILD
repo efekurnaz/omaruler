@@ -1,0 +1,35 @@
+# Maintainer: Efe Can KURNAZ <efekurnaz@gmail.com>
+
+# Prebuilt-binary package: no Rust toolchain, no compile step. It pulls the
+# release binary that .github/workflows/release.yml built (in an Arch
+# container, against the same gtk4 / gtk4-layer-shell this package depends
+# on) and attached to the GitHub release for the matching tag.
+#
+# On each new release, bump pkgver and run `updpkgsums` (pacman-contrib) to
+# replace the SKIP checksums with the real ones, then regenerate .SRCINFO
+# with `makepkg --printsrcinfo > .SRCINFO`.
+
+pkgname=omaruler-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="PixelSnap-style measuring ruler and color picker overlay for Omarchy/Hyprland (prebuilt binary)"
+arch=('x86_64')
+url="https://github.com/efekurnaz/omaruler"
+license=('MIT')
+# hyprctl / grim / wl-copy are called at runtime; omarchy-theme-color and
+# omarchy-osd are expected on PATH (they ship with Omarchy, which is not a
+# package). omarchy-legend is optional - omaruler draws the hint card itself
+# when it is missing.
+depends=('gtk4' 'gtk4-layer-shell' 'grim' 'wl-clipboard' 'hyprland')
+optdepends=('libpulse: sound effects for the hidden easter egg')
+provides=("omaruler=$pkgver")
+conflicts=('omaruler')
+source=("omaruler-$pkgver::$url/releases/download/v$pkgver/omaruler"
+        "LICENSE-$pkgver::$url/raw/v$pkgver/LICENSE")
+sha256sums=('SKIP'
+            'SKIP')
+
+package() {
+  install -Dm0755 "$srcdir/omaruler-$pkgver" "$pkgdir/usr/bin/omaruler"
+  install -Dm0644 "$srcdir/LICENSE-$pkgver" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
