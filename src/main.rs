@@ -343,6 +343,9 @@ struct State {
     /// a click can tell whether it landed on "open in omasnap" vs "start a
     /// new drag". Recomputed every draw() call.
     hover_box: Option<Rect>,
+    /// The cursor name last set on the window, so the per-frame visibility
+    /// sync only calls into GTK when it actually changes.
+    last_cursor_name: &'static str,
     snap_enabled: bool,
     tolerance_level: usize,
     show_legend: bool,
@@ -1061,23 +1064,28 @@ fn point_in_rect(p: (f64, f64), r: Rect) -> bool {
 
 /// The system cursor is rendered by the compositor via a low-latency
 /// hardware-cursor path, completely separate from our own client-side
-/// redraw — leaving it visible during precision work (hovering or
-/// dragging) means there are always two pointers on screen, and ours will
-/// always look laggy by comparison. Hide it while measuring; once at least
-/// one rectangle has snapped there's no more precision tracking to do, and
-/// a visible cursor makes it much easier to land a click on the small
-/// hover-to-open box.
-fn sync_cursor_visibility(window: &ApplicationWindow, st: &State) {
-    // GuideH/GuideV use the standard row-resize/col-resize cursors (a
-    // double-headed arrow with a bar through it) so placing a guide looks
-    // and feels like dragging one out of a ruler in any other design tool.
+/// redraw — whenever it's visible next to our drawn crosshair there are two
+/// pointers on screen and ours looks laggy by comparison. So in Ruler mode
+/// it stays hidden the whole time, *including* after a rectangle has
+/// snapped — the one exception is while the pointer is actually over the
+/// newest selection's open-in-omasnap box, where a real cursor makes that
+/// small click easy to land. GuideH/GuideV use the standard
+/// row-resize/col-resize cursors so placing a guide feels like dragging one
+/// off a ruler in any other design tool. Called every frame (see the tick
+/// callback) as well as on every mode change; the `last_cursor_name` guard
+/// keeps it from hitting GTK unless the answer actually changed.
+fn sync_cursor_visibility(window: &ApplicationWindow, st: &mut State) {
+    let over_open_box = st.hover_box.map_or(false, |hb| point_in_rect(st.cursor, hb));
     let name = match st.mode {
-        Mode::Ruler if !st.snapped_rects.is_empty() => "default",
+        Mode::Ruler if over_open_box => "default",
         Mode::GuideH => "row-resize",
         Mode::GuideV => "col-resize",
         _ => "none",
     };
-    window.set_cursor_from_name(Some(name));
+    if name != st.last_cursor_name {
+        st.last_cursor_name = name;
+        window.set_cursor_from_name(Some(name));
+    }
 }
 
 fn find_gdk_monitor(window: &ApplicationWindow, name: &str) -> Option<gdk::Monitor> {
@@ -1832,6 +1840,7 @@ fn build_ui(app: &Application) {
         start: None,
         snapped_rects: Vec::new(),
         hover_box: None,
+        last_cursor_name: "none",
         snap_enabled: true,
         tolerance_level: DEFAULT_TOLERANCE_LEVEL,
         show_legend: true,
@@ -1891,6 +1900,7 @@ fn build_ui(app: &Application) {
     // mouse.
     {
         let state = state.clone();
+        let window = window.clone();
         area.add_tick_callback(move |area, _clock| {
             if let Some(surface) = area.native().and_then(|n| n.surface()) {
                 let display = gtk4::prelude::WidgetExt::display(area);
@@ -1971,6 +1981,12 @@ fn build_ui(app: &Application) {
                     area.queue_draw();
                 }
             }
+
+            // Cursor shown/hidden purely from where the pointer is now
+            // (over the open-in-omasnap box or not), so it has to be
+            // re-evaluated every frame, not just on clicks and key presses.
+            sync_cursor_visibility(&window, &mut state.borrow_mut());
+
             glib::ControlFlow::Continue
         });
     }
@@ -2057,7 +2073,7 @@ fn build_ui(app: &Application) {
                     refresh_legend(&st);
                 }
             }
-            sync_cursor_visibility(&window, &st);
+            sync_cursor_visibility(&window, &mut st);
             drop(st);
             area.queue_draw();
         });
@@ -2096,7 +2112,7 @@ fn build_ui(app: &Application) {
                 }
                 st.start = None;
             }
-            sync_cursor_visibility(&window, &st);
+            sync_cursor_visibility(&window, &mut st);
             drop(st);
             area.queue_draw();
         });
@@ -2116,7 +2132,7 @@ fn build_ui(app: &Application) {
                     let mut st = state.borrow_mut();
                     if matches!(st.mode, Mode::GuideH | Mode::GuideV) {
                         st.mode = Mode::Ruler;
-                        sync_cursor_visibility(&window, &st);
+                        sync_cursor_visibility(&window, &mut st);
                         refresh_legend(&st);
                         drop(st);
                         area.queue_draw();
@@ -2145,7 +2161,7 @@ fn build_ui(app: &Application) {
                         st.duck_next_spawn = None;
                         st.duck_waiting_continue = false;
                         st.duck_score = 0;
-                        sync_cursor_visibility(&window, &st);
+                        sync_cursor_visibility(&window, &mut st);
                         refresh_legend(&st);
                         drop(st);
                         area.queue_draw();
@@ -2169,7 +2185,7 @@ fn build_ui(app: &Application) {
                     st.start = None;
                     st.snapped_rects.clear();
                     st.last_message = None;
-                    sync_cursor_visibility(&window, &st);
+                    sync_cursor_visibility(&window, &mut st);
                     refresh_legend(&st);
                     drop(st);
                     area.queue_draw();
@@ -2208,7 +2224,7 @@ fn build_ui(app: &Application) {
                     st.duck_next_spawn = None;
                     st.duck_waiting_continue = false;
                     st.duck_score = 0;
-                    sync_cursor_visibility(&window, &st);
+                    sync_cursor_visibility(&window, &mut st);
                     refresh_legend(&st);
                     drop(st);
                     area.queue_draw();
@@ -2228,7 +2244,7 @@ fn build_ui(app: &Application) {
                             UndoItem::MeasureV => { st.measure_lines_v.pop(); }
                         }
                     }
-                    sync_cursor_visibility(&window, &st);
+                    sync_cursor_visibility(&window, &mut st);
                     refresh_legend(&st);
                     drop(st);
                     area.queue_draw();
@@ -2312,7 +2328,7 @@ fn build_ui(app: &Application) {
                             return glib::Propagation::Proceed;
                         }
                         st.mode = Mode::GuideH;
-                        sync_cursor_visibility(&window, &st);
+                        sync_cursor_visibility(&window, &mut st);
                         refresh_legend(&st);
                     } else {
                         if st.mode != Mode::Ruler {
@@ -2334,7 +2350,7 @@ fn build_ui(app: &Application) {
                             return glib::Propagation::Proceed;
                         }
                         st.mode = Mode::GuideV;
-                        sync_cursor_visibility(&window, &st);
+                        sync_cursor_visibility(&window, &mut st);
                         refresh_legend(&st);
                     } else {
                         if st.mode != Mode::Ruler {
