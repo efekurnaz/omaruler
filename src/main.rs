@@ -354,6 +354,9 @@ struct State {
     /// does), the same hint entries are drawn locally in Cairo instead of
     /// shelling out — see `legend_entries`/`draw_builtin_legend`.
     legend_available: bool,
+    /// Whether `omasnap` is on PATH, checked once at startup — the camera
+    /// affordance on the newest selection opens the crop in its editor.
+    omasnap_available: bool,
     shift_held: bool,
     measure_lines_h: Vec<HLine>,
     measure_lines_v: Vec<VLine>,
@@ -1845,6 +1848,7 @@ fn build_ui(app: &Application) {
         tolerance_level: DEFAULT_TOLERANCE_LEVEL,
         show_legend: true,
         legend_available: command_exists("omarchy-legend"),
+        omasnap_available: command_exists("omasnap"),
         shift_held: false,
         measure_lines_h: Vec::new(),
         measure_lines_v: Vec::new(),
@@ -2040,7 +2044,13 @@ fn build_ui(app: &Application) {
                         && st.hover_box.map_or(false, |hb| point_in_rect(st.cursor, hb));
                     if hovering_open {
                         if let Some(&rect) = st.snapped_rects.last() {
-                            open_in_omasnap(&st, rect);
+                            if st.omasnap_available {
+                                open_in_omasnap(&st, rect);
+                            } else {
+                                // s / c still work without omasnap — they
+                                // save/copy the crop directly.
+                                flash_status("omasnap not installed");
+                            }
                         }
                     } else {
                         st.start = Some(st.cursor);
